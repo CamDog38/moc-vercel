@@ -92,6 +92,7 @@ export async function processEmailRulesDirect(
     console.log(`[DIRECT EMAIL] Found ${matchingRules.length} matching rules, processing emails`);
     
     // Process matching rules in parallel
+    console.log(`[DIRECT EMAIL] Starting to process ${matchingRules.length} matching rules with SendGrid as primary method`);
     const emailPromises = matchingRules.map(rule => processRuleActionsDirect(rule, formId, formData));
     const emailResults = await Promise.allSettled(emailPromises);
     
@@ -230,7 +231,8 @@ async function processSendEmailActionDirect(rule: EmailRule, formId: string, for
     const ccEmails = template.ccEmails || rule.ccEmails || '';
     const bccEmails = template.bccEmails || rule.bccEmails || '';
     
-    // Send the email using the centralized email service
+    // Send the email using the centralized email service (prioritizing SendGrid)
+    console.log(`[DIRECT EMAIL] Sending email to ${recipientEmail} via sendEmail2 (SendGrid primary, SMTP backup)`);
     const emailResult = await sendEmail2(
       recipientEmail,
       subject,
@@ -243,7 +245,9 @@ async function processSendEmailActionDirect(rule: EmailRule, formId: string, for
     const duration = Date.now() - startTime;
     
     if (emailResult.success) {
-      addApiLog(`[DIRECT] Email sent successfully to ${recipientEmail} for rule: ${rule.id} in ${duration}ms`, 'success', 'emails');
+      const provider = emailResult.directEmailUsed ? 'direct SMTP' : 'SendGrid';
+      console.log(`[DIRECT EMAIL] Email sent successfully to ${recipientEmail} via ${provider} for rule: ${rule.id} in ${duration}ms`);
+      addApiLog(`[DIRECT] Email sent successfully to ${recipientEmail} for rule: ${rule.id} in ${duration}ms via ${provider}`, 'success', 'emails');
       return {
         recipient: recipientEmail,
         subject,

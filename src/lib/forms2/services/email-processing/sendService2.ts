@@ -4,14 +4,52 @@
  * This service handles sending emails via SendGrid with SMTP as a backup.
  */
 
-import { PrismaClient } from '@prisma/client';
-import sgMail, { ClientResponse } from '@sendgrid/mail';
-import { EmailSendResult } from './types';
+/**
+ * Import dependencies with proper TypeScript handling
+ */
+// Import Prisma client from the shared instance
+import { prisma } from '@/lib/prisma';
+
+// Import email processing utilities
 import { sendDirectEmail, initializeDirectEmailService } from './directEmailService';
 import { EMAIL_TIMEOUTS, EMAIL_RETRY, withTimeout } from './emailConfig2';
 
-// Initialize Prisma client
-const prisma = new PrismaClient();
+// Import SendGrid with proper type handling
+// @ts-ignore - Using require to avoid TypeScript errors with SendGrid
+const sgMail = require('@sendgrid/mail');
+
+/**
+ * Type definitions to avoid import issues
+ */
+// Define the ClientResponse type inline
+interface ClientResponse {
+  statusCode: number;
+  body: any;
+  headers: {
+    [key: string]: string;
+  };
+}
+
+// Define EmailSendResult interface inline
+interface EmailSendResult {
+  success: boolean;
+  message: string;
+  error?: string;
+  directEmailUsed?: boolean;
+}
+
+// Define MailDataRequired interface for SendGrid
+interface MailDataRequired {
+  to: string | string[];
+  from: string;
+  subject: string;
+  text: string;
+  html: string;
+  cc?: string | string[];
+  bcc?: string | string[];
+}
+
+// Prisma client is imported from @/lib/prisma
 
 // Initialize flags to track service status
 let directEmailInitialized = false;
@@ -117,7 +155,7 @@ export async function sendEmail2(
     console.log(`[EMAIL SENDING] Using SendGrid as primary method`);
     try {
       // Format the email for SendGrid
-      const msg: sgMail.MailDataRequired = {
+      const msg: MailDataRequired = {
         to: recipient,
         from: process.env.SENDGRID_FROM_EMAIL || 'notifications@marriageofficer.co.za',
         subject: subject,

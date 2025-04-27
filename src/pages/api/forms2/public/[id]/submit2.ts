@@ -27,6 +27,19 @@ type NextApiResponse = {
   json: (data: any) => void;
 };
 
+// Define FormSubmission type to fix TypeScript errors
+type FormSubmission = {
+  id: string;
+  formId: string;
+  data: Record<string, any>;
+  createdAt: Date;
+  leadId?: string;
+  bookingId?: string;
+  sourceLeadId?: string;
+  trackingToken?: string;
+  timeStamp?: number;
+};
+
 // Helper function to ensure string type
 function ensureString(value: string | string[] | undefined): string {
   if (Array.isArray(value)) {
@@ -162,7 +175,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             // First, get the submission data from the database
             const submission = await prisma.formSubmission.findUnique({
               where: { id: result.submissionId }
-            });
+            }) as FormSubmission | null;
             
             if (!submission) {
               console.error(`[FORMS2] Submission not found: ${result.submissionId}`);
@@ -212,7 +225,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
             // First, get the submission data from the database
             const submission = await prisma.formSubmission.findUnique({
               where: { id: result.submissionId }
-            });
+            }) as FormSubmission | null;
             
             if (!submission) {
               console.error(`[FORMS2] Submission not found: ${result.submissionId}`);
