@@ -12,14 +12,36 @@
  * - Performance metrics
  */
 
-import { NextApiRequest, NextApiResponse } from 'next';
+// Using explicit type declarations to avoid Next.js import issues
+type NextApiRequest = {
+  method?: string;
+  query: Record<string, string | string[]>;
+  body: any;
+  headers: {
+    [key: string]: string | string[] | undefined;
+  };
+};
+
+type NextApiResponse = {
+  status: (code: number) => NextApiResponse;
+  json: (data: any) => void;
+};
+
+// Helper function to ensure string type
+function ensureString(value: string | string[] | undefined): string {
+  if (Array.isArray(value)) {
+    return value[0] || '';
+  }
+  return value || '';
+}
 import * as logger from '@/util/logger';
 import { FormRepository } from '@/lib/forms2/repositories/form/formRepository';
 import { bulkLeadSubmissionService } from '@/lib/forms2/services/bulk/bulkLeadSubmissionService';
 import { bulkBookingSubmissionService } from '@/lib/forms2/services/bulk/bulkBookingSubmissionService';
 import { handleApiError } from '@/lib/forms2/services/submission';
-import axios from 'axios';
-import { EMAIL_TIMEOUTS } from '@/lib/forms2/services/email-processing/emailConfig2';
+import { processEmailRulesDirect } from '@/lib/forms2/services/email-processing/directEmailProcessor';
+import { initializeDirectEmailService } from '@/lib/forms2/services/email-processing/directEmailService';
+import prisma from '@/lib/prisma';
 
 // Define the SubmissionResult interface
 interface SubmissionResult {
@@ -44,9 +66,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   const startTime = Date.now();
   
   // Extract form ID from the request
-  const { id } = req.query;
+  const id = ensureString(req.query.id);
 
-  if (!id || typeof id !== 'string') {
+  if (!id) {
     return res.status(400).json({ error: 'Form ID is required' });
   }
 
@@ -99,21 +121,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     // Get the source URL from headers or use a default
-    const sourceUrl = req.headers.referer || 'forms2-api';
+    const sourceUrl = ensureString(req.headers.referer) || 'forms2-api';
     
     // Prepare for submission processing
     const submissionStart = Date.now();
     let result: ExtendedSubmissionResult;
     
     // Process the submission based on form type
-    if (form.type === 'BOOKING') {
+    // Use type assertion to help TypeScript understand the form type
+    const formType = form.type as string;
+    if (formType === 'BOOKING') {
       console.log(`[FORMS2] Processing booking form submission with source URL: ${sourceUrl}`);
       
       // Process the submission using our booking service
       result = await bulkBookingSubmissionService.processSubmission(
-        id,
+        id, // id is already a string thanks to ensureString
         formData,
-        sourceUrl
+        sourceUrl as string
       ) as ExtendedSubmissionResult;
       
       // Add the form type to the result
@@ -125,8 +149,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       if (result.submissionId) {
         logger.info(`Booking form submission processed successfully with ID: ${result.submissionId}`, 'forms');
         
-        // Trigger email processing asynchronously
-        triggerAsyncEmailProcessing(id, result.submissionId);
+        // Process emails directly without API calls
+        console.log(`[FORMS2] Starting direct email processing for booking submission: ${result.submissionId}`);
+        // Pre-connect to SMTP server to speed up email sending
+        initializeDirectEmailService().catch(error => {
+          console.error(`[FORMS2] SMTP pre-connection error:`, error);
+        });
+        
+        // Process emails asynchronously but without setTimeout or API calls
+        Promise.resolve().then(async () => {
+          try {
+            // First, get the submission data from the database
+            const submission = await prisma.formSubmission.findUnique({
+              where: { id: result.submissionId }
+            });
+            
+            if (!submission) {
+              console.error(`[FORMS2] Submission not found: ${result.submissionId}`);
+              return;
+            }
+            
+            // Process email rules with the submission data
+            const emailResult = await processEmailRulesDirect(id, submission.data, result.submissionId);
+            console.log(`[FORMS2] Email processing completed successfully for booking submission: ${result.submissionId}`);
+            console.log(`[FORMS2] Email processing result:`, emailResult);
+          } catch (error) {
+            console.error(`[FORMS2] Error processing email rules: ${error}`);
+            logger.error(`Error processing email rules: ${error}`, 'emails');
+          }
+        });
       }
     } else {
       // This is an inquiry form
@@ -134,9 +185,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       
       // Process the submission using our lead service
       result = await bulkLeadSubmissionService.processSubmission(
-        id,
+        id, // id is already a string thanks to ensureString
         formData,
-        sourceUrl
+        sourceUrl as string
       ) as ExtendedSubmissionResult;
       
       // Add the form type to the result
@@ -144,12 +195,39 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       
       console.log(`[FORMS2] Lead submission processing took ${Date.now() - submissionStart}ms`);
       
-      // Process emails for the lead submission asynchronously
+      // Process emails for the lead submission directly
       if (result.submissionId) {
         logger.info(`Form submission processed successfully with ID: ${result.submissionId}`, 'forms');
         
-        // Trigger email processing asynchronously
-        triggerAsyncEmailProcessing(id, result.submissionId);
+        // Process emails directly without API calls
+        console.log(`[FORMS2] Starting direct email processing for lead submission: ${result.submissionId}`);
+        // Pre-connect to SMTP server to speed up email sending
+        initializeDirectEmailService().catch(error => {
+          console.error(`[FORMS2] SMTP pre-connection error:`, error);
+        });
+        
+        // Process emails asynchronously but without setTimeout or API calls
+        Promise.resolve().then(async () => {
+          try {
+            // First, get the submission data from the database
+            const submission = await prisma.formSubmission.findUnique({
+              where: { id: result.submissionId }
+            });
+            
+            if (!submission) {
+              console.error(`[FORMS2] Submission not found: ${result.submissionId}`);
+              return;
+            }
+            
+            // Process email rules with the submission data
+            const emailResult = await processEmailRulesDirect(id, submission.data, result.submissionId);
+            console.log(`[FORMS2] Email processing completed successfully for lead submission: ${result.submissionId}`);
+            console.log(`[FORMS2] Email processing result:`, emailResult);
+          } catch (error) {
+            console.error(`[FORMS2] Error processing email rules: ${error}`);
+            logger.error(`Error processing email rules: ${error}`, 'emails');
+          }
+        });
       }
     }
     
@@ -181,30 +259,5 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
   }
 }
 
-/**
- * Trigger email processing asynchronously
- * This function uses setTimeout to ensure the email processing happens after the response is sent
- */
-function triggerAsyncEmailProcessing(formId: string, submissionId: string): void {
-  setTimeout(() => {
-    console.log(`[FORMS2] Starting asynchronous email processing for submission: ${submissionId}`);
-    
-    const emailProcessingUrl = `${process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000'}/api/emails/process-submission-async2`;
-    
-    axios.post(emailProcessingUrl, {
-      submissionId: submissionId,
-      formId: formId,
-      source: 'server-api',
-      internalApiKey: 'forms-system-internal'
-    }, {
-      timeout: EMAIL_TIMEOUTS.EMAIL_PROCESSING_API
-    })
-    .then(emailResponse => {
-      console.log(`[FORMS2] Email processing initiated:`, emailResponse.data);
-    })
-    .catch(emailError => {
-      console.error(`[FORMS2] Error initiating email processing:`, emailError.message);
-      logger.error(`Error initiating email processing for submission: ${emailError.message}`, 'forms');
-    });
-  }, 10); // 10ms delay to ensure response is sent first
-}
+// The old triggerAsyncEmailProcessing function has been replaced with direct email processing
+// using processEmailRulesDirect from directEmailProcessor.ts
