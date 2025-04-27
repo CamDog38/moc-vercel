@@ -1,0 +1,517 @@
+import { NextApiRequest, NextApiResponse } from 'next';
+import { Prisma } from '@prisma/client';
+import prisma from '@/lib/prisma';
+import { addApiLog } from '@/pages/api/debug/logs';
+import { replaceVariables } from '@/util/email-template-helpers';
+import { sendEmail } from '@/util/email-sender';
+import { waitForEmailDelay } from '@/util/email-delay';
+
+// Use global fetch instead of node-fetch
+// This works in Next.js environments without additional imports
+
+// Define the interface for the function parameters
+interface ProcessEmailAsyncParams {
+  templateId: string;
+  submissionId: string;
+  data?: Record<string, any>;
+  leadId?: string;
+  userId?: string;
+  recipient: string;
+  ccEmails?: string;
+  bccEmails?: string;
+  ruleId?: string;
+}
+
+/**
+ * Extract variables from the parameters for legacy support
+ */
+function extractVariables(params: ProcessEmailAsyncParams) {
+  // Return normalized variables from the params
+  const {
+    templateId,
+    submissionId,
+    data = {},
+    leadId = null,
+    userId = '',
+    recipient,
+    ccEmails,
+    bccEmails,
+    ruleId = null
+  } = params;
+
+  return {
+    templateId,
+    submissionId,
+    data,
+    leadId,
+    userId,
+    recipient,
+    ccEmails,
+    bccEmails,
+    ruleId
+  };
+}
+
+/**
+ * Process an email synchronously directly from the API
+ * This used to be async via background jobs but now processes emails directly
+ */
+export async function processEmailAsync(
+  paramOrTemplateId: ProcessEmailAsyncParams | string,
+  submissionId?: string,
+  formData?: Record<string, any>,
+  leadId?: string,
+  userId?: string,
+  recipientEmail?: string,
+  ccEmails?: string,
+  bccEmails?: string
+): Promise<any> {
+  await waitForEmailDelay();
+  
+  try {
+    // Support both object-based and positional parameters for backward compatibility
+    let processTemplateId: string;
+    let processSubmissionId: string;
+    let processFormData: Record<string, any> = {};
+    let processLeadId: string | null = null;
+    let processUserId: string = '';
+    let processRecipientEmail: string;
+    let processCcEmails: string | undefined;
+    let processBccEmails: string | undefined;
+    let processRuleId: string | null = null;
+
+    if (typeof paramOrTemplateId === 'object') {
+      // If the first param is an object, extract variables from it
+      const vars = extractVariables(paramOrTemplateId);
+      processTemplateId = vars.templateId;
+      processSubmissionId = vars.submissionId;
+      processFormData = vars.data || {};
+      processLeadId = vars.leadId || null;
+      processUserId = vars.userId || '';
+      processRecipientEmail = vars.recipient;
+      processCcEmails = vars.ccEmails;
+      processBccEmails = vars.bccEmails;
+      processRuleId = vars.ruleId || null;
+    } else {
+      // Use positional parameters
+      processTemplateId = paramOrTemplateId;
+      processSubmissionId = submissionId || '';
+      processFormData = formData || {};
+      processLeadId = leadId || null;
+      processUserId = userId || '';
+      processRecipientEmail = recipientEmail || '';
+      processCcEmails = ccEmails;
+      processBccEmails = bccEmails;
+    }
+
+    // Validate required parameters
+    if (!processTemplateId) {
+      addApiLog('Missing templateId in processEmailAsync', 'error', 'emails');
+      throw new Error('Missing templateId');
+    }
+
+    if (!processSubmissionId) {
+      addApiLog('Missing submissionId in processEmailAsync', 'error', 'emails');
+      throw new Error('Missing submissionId');
+    }
+
+    if (!processRecipientEmail) {
+      addApiLog('Missing recipient email in processEmailAsync', 'error', 'emails');
+      throw new Error('Missing recipient email');
+    }
+
+    addApiLog(`Processing email for template: ${processTemplateId}, submission: ${processSubmissionId}, recipient: ${processRecipientEmail}`, 'info', 'emails');
+    
+    // Process the email directly
+    
+    try {
+      // Find the template
+      const template = await prisma.emailTemplate.findUnique({
+        where: { id: processTemplateId }
+      });
+      
+      if (!template) {
+        throw new Error(`Template not found: ${processTemplateId}`);
+      }
+      
+      // Fetch the submission to get additional data
+      const submission = await prisma.formSubmission.findUnique({
+        where: { id: processSubmissionId },
+        include: { lead: true }
+      });
+      
+      if (!submission) {
+        throw new Error(`Submission not found: ${processSubmissionId}`);
+      }
+      
+      // Prepare data for variable replacement
+      // Handle timeStamp field carefully to ensure it works in all environments
+      let timeStampValue: string;
+      
+      // Try to get timeStamp from submission
+      if (submission.timeStamp !== undefined && submission.timeStamp !== null) {
+        timeStampValue = submission.timeStamp;
+        addApiLog(`Using timeStamp from submission: ${timeStampValue}`, 'info', 'emails');
+      } 
+      // If timeStamp is null or undefined, try to use createdAt as fallback
+      else if (submission.createdAt) {
+        // Convert Date to timestamp string
+        if (submission.createdAt instanceof Date) {
+          timeStampValue = submission.createdAt.getTime().toString();
+        } else if (typeof submission.createdAt === 'string') {
+          // If it's already a string, try to parse it as a date and convert to timestamp
+          try {
+            timeStampValue = new Date(submission.createdAt).getTime().toString();
+          } catch (e) {
+            // If parsing fails, use the string directly
+            timeStampValue = submission.createdAt;
+          }
+        } else {
+          // Fallback to current timestamp
+          timeStampValue = Date.now().toString();
+        }
+        addApiLog(`Using createdAt as timeStamp fallback: ${timeStampValue}`, 'info', 'emails');
+      } else {
+        // Last resort: generate a new timestamp
+        timeStampValue = Date.now().toString();
+        addApiLog(`Generated new timeStamp: ${timeStampValue}`, 'info', 'emails');
+      }
+      
+      // Create the processed data object with all necessary fields
+      const processedData: Record<string, any> = {
+        ...processFormData,
+        submission: submission,
+        formSubmission: submission,
+        userId: processUserId,
+        leadId: submission.leadId || processLeadId,
+        // Use our carefully extracted timeStamp value
+        timeStamp: timeStampValue
+      };
+      
+      // IMPORTANT: Flatten the submission data to the top level for direct access
+      // This helps templates that use {{fieldName}} instead of {{submission.data.fieldName}}
+      if (submission?.data && typeof submission.data === 'object') {
+        Object.entries(submission.data).forEach(([key, value]) => {
+          processedData[key] = value;
+          
+          // Special case for firstName - some templates may use this
+          if (key.toLowerCase() === 'name' || key.toLowerCase() === 'fullname') {
+            const nameParts = String(value).split(' ');
+            if (nameParts.length > 0) {
+              processedData.firstName = nameParts[0];
+              addApiLog(`Extracted firstName '${nameParts[0]}' from '${key}': '${value}'`, 'info', 'emails');
+            }
+          }
+        });
+        
+        // Log the flattened data keys
+        addApiLog(`Flattened submission data keys: ${Object.keys(submission.data).join(', ')}`, 'info', 'emails');
+      }
+      
+      // Also add formData property for consistent access
+      processedData.formData = submission?.data || {};
+      
+      // Ensure firstName is available for templates
+      // Log environment information for debugging
+      addApiLog(`Environment for firstName extraction: ${process.env.NODE_ENV || 'unknown'}`, 'info', 'emails');
+      addApiLog(`Deployment URL: ${process.env.NEXT_PUBLIC_DEPLOYMENT_URL || 'not set'}`, 'info', 'emails');
+      
+      // Log the current state of firstName
+      if (processedData.firstName) {
+        addApiLog(`firstName already exists in processedData: ${processedData.firstName}`, 'success', 'emails');
+      } else {
+        addApiLog(`firstName not found in processedData, attempting extraction...`, 'info', 'emails');
+      }
+      
+      // IMPORTANT FIX: Ensure firstName is explicitly set in processedData
+      // This is a critical fix to ensure {{firstName}} is replaced in templates
+      if (!processedData.firstName) {
+        // Try to extract from name field at top level
+        if (processedData.name && typeof processedData.name === 'string') {
+          const nameParts = processedData.name.split(' ');
+          if (nameParts.length > 0) {
+            processedData.firstName = nameParts[0];
+            addApiLog(`FIXED: Extracted firstName '${nameParts[0]}' from top-level name: '${processedData.name}'`, 'success', 'emails');
+          }
+        }
+        // If still not found, check formData
+        if (!processedData.firstName && processedData.formData) {
+          // Check common field names
+          if (processedData.formData.firstName) {
+            processedData.firstName = processedData.formData.firstName;
+            addApiLog(`FIXED: Using firstName directly from formData: ${processedData.firstName}`, 'success', 'emails');
+          } else if (processedData.formData.first_name) {
+            processedData.firstName = processedData.formData.first_name;
+            addApiLog(`FIXED: Using first_name from formData: ${processedData.firstName}`, 'success', 'emails');
+          } else if (processedData.formData.name) {
+            const nameParts = String(processedData.formData.name).split(' ');
+            if (nameParts.length > 0) {
+              processedData.firstName = nameParts[0];
+              addApiLog(`FIXED: Extracted firstName from formData.name: ${processedData.firstName}`, 'success', 'emails');
+            }
+          }
+        }
+        
+        // If still not found, use default
+        if (!processedData.firstName) {
+          processedData.firstName = "Customer";
+          addApiLog(`FIXED: Using default firstName: ${processedData.firstName}`, 'success', 'emails');
+        }
+      }
+      
+      // Log the data structure for debugging
+      addApiLog(`Data structure for firstName extraction: ${JSON.stringify({
+        hasName: !!processedData.name,
+        nameType: processedData.name ? typeof processedData.name : 'undefined',
+        nameValue: processedData.name,
+        hasFormData: !!processedData.formData,
+        formDataKeys: processedData.formData ? Object.keys(processedData.formData) : [],
+        hasSubmission: !!processedData.submission,
+        submissionDataType: processedData.submission?.data ? typeof processedData.submission.data : 'undefined',
+        submissionDataKeys: processedData.submission?.data ? Object.keys(processedData.submission.data) : []
+      })}`, 'info', 'emails');
+      
+      if (!processedData.firstName) {
+        // Try to extract from name field at top level
+        if (processedData.name && typeof processedData.name === 'string') {
+          const nameParts = processedData.name.split(' ');
+          if (nameParts.length > 0) {
+            processedData.firstName = nameParts[0];
+            addApiLog(`Extracted firstName '${nameParts[0]}' from top-level name: '${processedData.name}'`, 'success', 'emails');
+          } else {
+            addApiLog(`Could not extract firstName from top-level name: '${processedData.name}' - no name parts found`, 'error', 'emails');
+          }
+        } else {
+          addApiLog(`No top-level name field available for firstName extraction`, 'info', 'emails');
+        }
+        
+        // If still not found, check formData
+        if (!processedData.firstName) {
+          addApiLog(`Checking formData for firstName...`, 'info', 'emails');
+          
+          // Check common field names
+          if (processedData.formData.firstName) {
+            processedData.firstName = processedData.formData.firstName;
+            addApiLog(`Using firstName directly from formData: ${processedData.firstName}`, 'success', 'emails');
+          } else if (processedData.formData.first_name) {
+            processedData.firstName = processedData.formData.first_name;
+            addApiLog(`Using first_name from formData: ${processedData.firstName}`, 'success', 'emails');
+          } else if (processedData.formData.name) {
+            const nameParts = String(processedData.formData.name).split(' ');
+            if (nameParts.length > 0) {
+              processedData.firstName = nameParts[0];
+              addApiLog(`Extracted firstName '${nameParts[0]}' from formData.name: '${processedData.formData.name}'`, 'success', 'emails');
+            } else {
+              addApiLog(`Could not extract firstName from formData.name: '${processedData.formData.name}' - no name parts found`, 'error', 'emails');
+            }
+          } else {
+            addApiLog(`No common name fields found in formData`, 'info', 'emails');
+            
+            // Search for any field that might contain a name
+            for (const [key, value] of Object.entries(processedData.formData)) {
+              if (
+                key.toLowerCase().includes('name') || 
+                (key.toLowerCase().includes('first') && typeof value === 'string')
+              ) {
+                addApiLog(`Found potential name field: ${key} = ${value}`, 'info', 'emails');
+                
+                if (typeof value === 'string' && value.trim()) {
+                  // If it's a full name, extract first name
+                  if (value.includes(' ')) {
+                    const nameParts = value.split(' ');
+                    processedData.firstName = nameParts[0];
+                    addApiLog(`Extracted firstName '${nameParts[0]}' from field ${key}: '${value}'`, 'success', 'emails');
+                    break;
+                  } else {
+                    // If it's a single word, use it directly
+                    processedData.firstName = value;
+                    addApiLog(`Using single word name '${value}' from field ${key} as firstName`, 'success', 'emails');
+                    break;
+                  }
+                }
+              }
+            }
+          }
+          
+          // If still not found, use default
+          if (!processedData.firstName) {
+            processedData.firstName = "Customer";
+            addApiLog(`Using default firstName "Customer" as no name was found in any location`, 'info', 'emails');
+          }
+        }
+      }
+      
+      // Verify that firstName is now available
+      addApiLog(`Final firstName value: ${processedData.firstName}`, 'success', 'emails');
+      
+      // Check if template contains bookingLink variable
+      if (template.htmlContent.includes('{{bookingLink}}')) {
+        // Provide a placeholder instead of generating an actual booking link
+        processedData.bookingLink = '[Booking Link Generation Disabled in Emails]';
+        addApiLog(`Template contains bookingLink variable but generation is disabled`, 'info', 'emails');
+      }
+      
+      // Log the data being used for variable replacement
+      addApiLog(`Variable replacement data for async processing: ${JSON.stringify({
+        dataKeys: Object.keys(processedData),
+        hasSubmission: !!processedData.submission,
+        hasFormSubmission: !!processedData.formSubmission,
+        submissionKeys: processedData.submission ? Object.keys(processedData.submission) : [],
+        formDataKeys: Object.keys(processedData.formData || {})
+      })}`, 'info', 'emails');
+      
+      // Find all variables in the template for better logging
+      const templateVariables = [
+        ...(template.subject.match(/\{\{([^}]+)\}\}/g) || []),
+        ...(template.htmlContent.match(/\{\{([^}]+)\}\}/g) || [])
+      ];
+      
+      if (templateVariables.length > 0) {
+        addApiLog(`Template contains these variables: ${templateVariables.join(', ')}`, 'info', 'emails');
+      }
+      
+      // Replace variables in subject and content
+      // Log the data being used for variable replacement
+      addApiLog(`Variable replacement data for async processing: ${JSON.stringify({
+        dataKeys: Object.keys(processedData),
+        hasSubmission: !!processedData.submission,
+        hasFormSubmission: !!processedData.formSubmission,
+        submissionKeys: processedData.submission ? Object.keys(processedData.submission) : [],
+        formDataKeys: Object.keys(processedData)
+      })}`, 'info', 'emails');
+      
+      addApiLog('=== EMAIL DEBUG START ===', 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('=== EMAIL DEBUG START ===');
+      }
+      addApiLog(`Processed data: ${JSON.stringify(processedData)}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Processed data:', JSON.stringify(processedData, null, 2));
+      }
+      addApiLog(`Template subject before: ${template.subject}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Template subject before:', template.subject);
+      }
+      addApiLog(`Template HTML before: ${template.htmlContent}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Template HTML before:', template.htmlContent);
+      }
+
+      // Removed debug error throw to allow processing to continue
+
+      const processedSubject = replaceVariables(template.subject, processedData);
+      const processedHtml = replaceVariables(template.htmlContent, processedData);
+
+      addApiLog(`Processed subject after: ${processedSubject}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Processed subject after:', processedSubject);
+      }
+      addApiLog(`Processed HTML after: ${processedHtml}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Processed HTML after:', processedHtml);
+      }
+
+      const subjectVariables = template.subject.match(/\{\{([^}]+)\}\}/g) || [];
+      const bodyVariables = template.htmlContent.match(/\{\{([^}]+)\}\}/g) || [];
+
+      if (subjectVariables.length > 0) {
+        addApiLog(`Processed ${subjectVariables.length} variables in async subject: ${subjectVariables.join(', ')}`, 'info', 'emails');
+      }
+
+      if (bodyVariables.length > 0) {
+        addApiLog(`Processed ${bodyVariables.length} variables in async body: ${bodyVariables.join(', ')}`, 'info', 'emails');
+      }
+
+      addApiLog(`Sending email to: ${processRecipientEmail}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Sending email to:', processRecipientEmail);
+      }
+      addApiLog(`Email subject: ${processedSubject}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Email subject:', processedSubject);
+      }
+      addApiLog(`Email HTML: ${processedHtml}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Email HTML:', processedHtml);
+      }
+
+      // Add detailed logging for CC/BCC recipients
+      addApiLog(`CC Recipients: ${processCcEmails || 'None'}`, 'info', 'emails');
+      addApiLog(`BCC Recipients: ${processBccEmails || 'None'}`, 'info', 'emails');
+      console.log('[Forms2] Email CC Recipients:', processCcEmails);
+      console.log('[Forms2] Email BCC Recipients:', processBccEmails);
+      
+      // Log the full email configuration
+      const emailConfig = {
+        to: processRecipientEmail,
+        subject: processedSubject,
+        userId: processUserId,
+        templateId: template.id,
+        formSubmissionId: submission.id,
+        cc: processCcEmails,
+        bcc: processBccEmails
+      };
+      addApiLog(`Full email configuration: ${JSON.stringify(emailConfig)}`, 'info', 'emails');
+      console.log('[Forms2] Full email configuration:', emailConfig);
+
+      const emailResult = await sendEmail({
+        to: processRecipientEmail,
+        subject: processedSubject,
+        html: processedHtml,
+        userId: processUserId,
+        templateId: template.id,
+        formSubmissionId: submission.id,
+        cc: processCcEmails,
+        bcc: processBccEmails
+      });
+      addApiLog(`Send email result: ${JSON.stringify(emailResult)}`, 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('Send email result:', emailResult);
+      }
+      addApiLog('=== EMAIL DEBUG END ===', 'info', 'emails');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('=== EMAIL DEBUG END ===');
+      }
+      
+      if (!emailResult.success) {
+        throw new Error(emailResult.error || 'Unknown error sending email');
+      }
+      
+      addApiLog(`Email sent successfully to ${processRecipientEmail}`, 'success', 'emails');
+      
+      return { 
+        success: true, 
+        message: 'Email sent successfully'
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      addApiLog(`Error sending email: ${errorMessage}`, 'error', 'emails');
+      throw error;
+    }
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    addApiLog(`Error in async email processing: ${errorMessage}`, 'error', 'emails');
+    console.error('Error in async email processing:', error);
+    throw error;
+  }
+}
+
+/**
+ * API handler for async email processing
+ */
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const result = await processEmailAsync(req.body);
+    return res.status(200).json(result);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    return res.status(500).json({ error: errorMessage });
+  }
+}

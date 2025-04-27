@@ -1,0 +1,387 @@
+import { useState } from 'react';
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { CheckCircle, AlertCircle } from "lucide-react";
+import { useToast } from "@/components/ui/use-toast";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+
+export default function FormToEmailTest() {
+  const { toast } = useToast();
+  
+  const [formId, setFormId] = useState<string>('');
+  const [formData, setFormData] = useState<Record<string, string>>({});
+  const [formDataText, setFormDataText] = useState<string>('{\n  "email": "test@example.com",\n  "name": "Test User"\n}');
+  const [isLoading, setIsLoading] = useState(false);
+  const [testResult, setTestResult] = useState<any>(null);
+  const [logs, setLogs] = useState<string[]>([]);
+  
+  // Add a log entry with timestamp
+  const addLog = (message: string) => {
+    const timestamp = new Date().toISOString();
+    setLogs(prev => [...prev, `[${timestamp}] ${message}`]);
+  };
+  
+  // Parse form data from text area
+  const parseFormData = () => {
+    try {
+      const parsed = JSON.parse(formDataText);
+      setFormData(parsed);
+      addLog('Form data parsed successfully');
+      return parsed;
+    } catch (error) {
+      toast({
+        title: "Error",
+        description: "Invalid JSON in form data",
+        variant: "destructive",
+      });
+      addLog(`Error parsing form data: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      return null;
+    }
+  };
+  
+  // Test direct form submission
+  const testFormSubmission = async () => {
+    if (!formId) {
+      toast({
+        title: "Error",
+        description: "Please enter a form ID",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    const data = parseFormData();
+    if (!data) return;
+    
+    setIsLoading(true);
+    setTestResult(null);
+    addLog(`Testing form submission for form ID: ${formId}`);
+    
+    try {
+      addLog(`Sending request to /api/forms/${formId}/submit`);
+      const response = await fetch(`/api/forms/${formId}/submit`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(data),
+      });
+      
+      const result = await response.json();
+      setTestResult(result);
+      
+      addLog(`Form submission response: ${response.status} ${response.statusText}`);
+      addLog(`Response data: ${JSON.stringify(result)}`);
+      
+      toast({
+        title: response.ok ? "Success" : "Error",
+        description: response.ok ? "Form submitted successfully" : "Form submission failed",
+        variant: response.ok ? "default" : "destructive",
+      });
+    } catch (error) {
+      addLog(`Error submitting form: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast({
+        title: "Error",
+        description: "An error occurred while submitting the form",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+  
+  // Test direct email processing
+  const testEmailProcessing = async () => {
+    if (!formId) {
+      toast({
+        title: "Error",
+        description: "Please enter a form ID",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    const data = parseFormData();
+    if (!data) return;
+    
+    setIsLoading(true);
+    setTestResult(null);
+    addLog(`Testing email processing for form ID: ${formId}`);
+    
+    try {
+      addLog('Sending request to /api/emails/process-submission2');
+      const response = await fetch('/api/emails/process-submission2', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          formId,
+          formData: data,
+        }),
+      });
+      
+      const result = await response.json();
+      setTestResult(result);
+      
+      addLog(`Email processing response: ${response.status} ${response.statusText}`);
+      addLog(`Response data: ${JSON.stringify(result)}`);
+      
+      toast({
+        title: response.ok ? "Success" : "Warning",
+        description: response.ok ? "Email processed successfully" : "Email processing failed",
+        variant: response.ok ? "default" : "destructive",
+      });
+    } catch (error) {
+      addLog(`Error processing email: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast({
+        title: "Error",
+        description: "An error occurred while processing the email",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+  
+  // Test direct email sending
+  const testDirectEmail = async () => {
+    const data = parseFormData();
+    if (!data || !data.email) {
+      toast({
+        title: "Error",
+        description: "Please include an email field in your form data",
+        variant: "destructive",
+      });
+      return;
+    }
+    
+    setIsLoading(true);
+    setTestResult(null);
+    addLog(`Testing direct email sending to: ${data.email}`);
+    
+    try {
+      addLog('Sending request to /api/test/send-email');
+      const response = await fetch('/api/test/send-email', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          to: data.email,
+        }),
+      });
+      
+      const result = await response.json();
+      setTestResult(result);
+      
+      addLog(`Email test response: ${response.status} ${response.statusText}`);
+      addLog(`Response data: ${JSON.stringify(result)}`);
+      
+      toast({
+        title: response.ok ? "Success" : "Error",
+        description: response.ok ? "Email sent successfully" : "Email sending failed",
+        variant: response.ok ? "default" : "destructive",
+      });
+    } catch (error) {
+      addLog(`Error sending test email: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      toast({
+        title: "Error",
+        description: "An error occurred while sending the test email",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+  
+  // Clear logs
+  const clearLogs = () => {
+    setLogs([]);
+    addLog('Logs cleared');
+  };
+  
+  return (
+    <div className="container mx-auto p-6 max-w-6xl">
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-3xl font-bold">Form to Email Connection Tester</h1>
+      </div>
+      
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div>
+          <Card className="mb-6">
+            <CardHeader>
+              <CardTitle>Test Configuration</CardTitle>
+              <CardDescription>
+                Configure the test parameters for form submission and email processing
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="formId">Form ID</Label>
+                <Input
+                  id="formId"
+                  value={formId}
+                  onChange={(e) => setFormId(e.target.value)}
+                  placeholder="Enter the form ID"
+                />
+              </div>
+              
+              <div className="space-y-2">
+                <Label htmlFor="formData">Form Data (JSON)</Label>
+                <Textarea
+                  id="formData"
+                  value={formDataText}
+                  onChange={(e) => setFormDataText(e.target.value)}
+                  placeholder="Enter the form data as JSON"
+                  className="font-mono h-48"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Include field IDs and values that match the form structure
+                </p>
+              </div>
+            </CardContent>
+            <CardFooter className="flex flex-col space-y-2">
+              <Button 
+                onClick={testFormSubmission} 
+                disabled={isLoading || !formId}
+                className="w-full"
+              >
+                {isLoading ? "Processing..." : "Test Form Submission"}
+              </Button>
+              <Button 
+                onClick={testEmailProcessing} 
+                disabled={isLoading || !formId}
+                className="w-full"
+                variant="outline"
+              >
+                Test Email Processing Directly
+              </Button>
+              <Button 
+                onClick={testDirectEmail} 
+                disabled={isLoading}
+                className="w-full"
+                variant="outline"
+              >
+                Test Direct Email Sending
+              </Button>
+            </CardFooter>
+          </Card>
+        </div>
+        
+        <div>
+          <Card className="mb-6">
+            <CardHeader className="flex flex-row items-center justify-between">
+              <div>
+                <CardTitle>Test Logs</CardTitle>
+                <CardDescription>
+                  Real-time logs of the test process
+                </CardDescription>
+              </div>
+              <Button variant="outline" size="sm" onClick={clearLogs}>
+                Clear Logs
+              </Button>
+            </CardHeader>
+            <CardContent>
+              <div className="bg-black text-green-400 p-4 rounded-md font-mono text-sm h-[300px] overflow-auto">
+                {logs.length > 0 ? (
+                  logs.map((log, index) => (
+                    <div key={index} className="mb-1">
+                      {log}
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-gray-500">No logs yet. Run a test to see logs.</div>
+                )}
+              </div>
+            </CardContent>
+          </Card>
+          
+          {testResult && (
+            <Card className={testResult.success ? "border-green-300" : "border-amber-300"}>
+              <CardHeader className={testResult.success ? "bg-green-50" : "bg-amber-50"}>
+                <div className="flex items-center">
+                  {testResult.success ? (
+                    <CheckCircle className="h-5 w-5 text-green-600 mr-2" />
+                  ) : (
+                    <AlertCircle className="h-5 w-5 text-amber-600 mr-2" />
+                  )}
+                  <CardTitle className={testResult.success ? "text-green-800" : "text-amber-800"}>
+                    {testResult.success ? "Success" : "Warning/Error"}
+                  </CardTitle>
+                </div>
+                <CardDescription className={testResult.success ? "text-green-700" : "text-amber-700"}>
+                  {testResult.message}
+                </CardDescription>
+              </CardHeader>
+              <CardContent className="pt-4">
+                <Tabs defaultValue="formatted">
+                  <TabsList className="mb-4">
+                    <TabsTrigger value="formatted">Formatted</TabsTrigger>
+                    <TabsTrigger value="raw">Raw JSON</TabsTrigger>
+                  </TabsList>
+                  
+                  <TabsContent value="formatted">
+                    <div className="space-y-4">
+                      {testResult.results && (
+                        <div>
+                          <h3 className="font-semibold mb-2">Email Rules Results</h3>
+                          <div className="space-y-3">
+                            {testResult.results.map((result: any, index: number) => (
+                              <div 
+                                key={index} 
+                                className={`p-3 rounded-md ${result.sent ? 'bg-green-50 border border-green-200' : 'bg-amber-50 border border-amber-200'}`}
+                              >
+                                <p className="font-medium">{result.ruleName || `Rule ${index + 1}`}</p>
+                                {result.sent ? (
+                                  <p className="text-green-700 mt-1">Email sent successfully</p>
+                                ) : (
+                                  <p className="text-amber-700 mt-1">{result.message}</p>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      
+                      {testResult.submissionId && (
+                        <div>
+                          <h3 className="font-semibold mb-2">Submission ID</h3>
+                          <div className="bg-gray-50 p-3 rounded-md">
+                            <p>{testResult.submissionId}</p>
+                          </div>
+                        </div>
+                      )}
+                      
+                      {testResult.error && (
+                        <Alert variant="destructive">
+                          <AlertCircle className="h-4 w-4" />
+                          <AlertTitle>Error</AlertTitle>
+                          <AlertDescription>
+                            {testResult.error}
+                          </AlertDescription>
+                        </Alert>
+                      )}
+                    </div>
+                  </TabsContent>
+                  
+                  <TabsContent value="raw">
+                    <Textarea
+                      className="font-mono text-sm h-[300px]"
+                      value={JSON.stringify(testResult, null, 2)}
+                      readOnly
+                    />
+                  </TabsContent>
+                </Tabs>
+              </CardContent>
+            </Card>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,317 @@
+/**
+ * Bookings API
+ * 
+ * This API endpoint handles all booking-related operations
+ */
+
+import { NextApiRequest, NextApiResponse } from 'next';
+import prisma from '@/lib/prisma';
+import axios from 'axios';
+import { createClient } from '@/util/supabase/api';
+import { ensureUserExists } from '@/util/auth-helpers';
+import { addApiLog } from '../debug/logs';
+import * as logger from '@/util/logger';
+import bookingService from '@/lib/bookings/services/bookingService';
+import { BookingFilters } from '@/lib/bookings/types/types';
+
+/**
+ * Bookings API Handler
+ */
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // Check if this is a public context request (no authentication required)
+  const isPublicContext = req.headers['x-public-context'] === 'true';
+  
+  try {
+    // Only authenticate if not in public context
+    if (!isPublicContext) {
+      // Get the authenticated user
+      const supabase = createClient(req, res);
+      const { data: { user }, error: authError } = await supabase.auth.getUser();
+
+      if (authError || !user) {
+        addApiLog('Authentication error', 'error', 'bookings');
+        if (process.env.NODE_ENV !== 'production') {
+          console.error('API: Authentication error:', authError);
+        }
+        return res.status(401).json({ error: 'Authentication failed' });
+      }
+
+      addApiLog('User authenticated', 'success', 'bookings');
+      
+      // Ensure user exists in the database
+      let dbUser;
+      try {
+        dbUser = await ensureUserExists(user);
+      } catch (error) {
+        addApiLog(`Error ensuring user exists: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'bookings');
+        if (process.env.NODE_ENV !== 'production') {
+          console.error('API: Failed to ensure user exists:', error);
+        }
+        return res.status(401).json({ error: 'Failed to verify user in database' });
+      }
+
+      addApiLog('User exists in database', 'success', 'bookings');
+      
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('API: Authenticated user:', user.id, 'Role:', dbUser?.role);
+      }
+    } else {
+      addApiLog('Public context request, skipping authentication', 'info', 'bookings');
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('API: Public context request, skipping authentication');
+      }
+    }
+
+    switch (req.method) {
+      case 'GET':
+        return await handleGetBookings(req, res, isPublicContext);
+      
+      case 'POST':
+        return await handleCreateBooking(req, res, isPublicContext);
+        
+      case 'PUT':
+        return await handleUpdateBooking(req, res, isPublicContext);
+        
+      default:
+        res.setHeader('Allow', ['GET', 'POST', 'PUT']);
+        return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
+    }
+  } catch (error) {
+    addApiLog(`Error in bookings API: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'bookings');
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('API: Error in bookings API:', error);
+    }
+    return res.status(500).json({ 
+      error: 'Failed to process request', 
+      details: error instanceof Error ? error.message : 'Unknown error' 
+    });
+  }
+}
+          name: true,
+          formSections: {
+          // Execute the query with a timeout
+          const bookingPromise = prisma.booking.create({
+            data: {
+              formId,
+              date: bookingDate,
+              name,
+              email,
+              phone,
+              status: 'PENDING'
+            },
+            include: {
+              form: true,
+              submissions: true,
+              invoices: true
+            }
+          });
+          
+          // Race the promises and ensure booking isn't null
+          let booking: any = null;
+          try {
+            booking = await Promise.race([bookingPromise, timeoutPromise]);
+            
+            addApiLog(`Booking created with ID: ${booking?.id || 'unknown'}`, 'success', 'bookings');
+            if (process.env.NODE_ENV !== 'production') {
+              console.log('API: Successfully created booking:', booking?.id || 'unknown');
+            }
+          } catch (error) {
+            addApiLog(`Error creating booking: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'bookings');
+            throw error; // Rethrow to be caught by the outer try/catch
+          }
+          
+          // If we have mapped data, create a form submission
+          if (mappedData && Object.keys(mappedData).length > 0 && booking) {
+            addApiLog(`Creating form submission for booking ID: ${booking.id}`, 'info', 'bookings');
+            if (process.env.NODE_ENV !== 'production') {
+              console.log('API: Creating form submission for booking:', booking.id);
+            }
+            
+            // Extract tracking token and source lead ID if present
+            const trackingToken = mappedData._trackingToken || null;
+            const sourceLeadId = mappedData._sourceLeadId || null;
+            const timeStamp = new Date().getTime().toString();
+            
+            console.log('DEBUG - Form submission tracking data:', {
+              trackingToken,
+              sourceLeadId,
+              timeStamp
+            });
+            
+            addApiLog(`Form submission tracking data: ${JSON.stringify({
+              trackingToken,
+              sourceLeadId,
+              timeStamp
+            })}`, 'info', 'bookings');
+            
+            try {
+              const submission = await prisma.formSubmission.create({
+                data: {
+                  formId,
+                  bookingId: booking.id,
+                  data: mappedData,
+                  trackingToken,
+                  sourceLeadId,
+                  timeStamp
+                }
+              });
+              
+              addApiLog(`Form submission created with ID: ${submission.id}`, 'success', 'bookings');
+              if (process.env.NODE_ENV !== 'production') {
+                console.log('API: Successfully created submission:', submission.id);
+              }
+              
+              // Process email rules for this submission
+              try {
+                addApiLog(`Processing email rules for submission: ${submission.id}`, 'info', 'bookings');
+                if (process.env.NODE_ENV !== 'production') {
+                  console.log('API: Processing email rules for submission:', submission.id);
+                }
+                
+                // Log what we're doing
+                addApiLog(`Directly processing email rules with data: ${JSON.stringify({
+                  formId,
+                  submissionId: submission.id,
+                  formDataKeys: Object.keys(mappedData)
+                })}`, 'info', 'bookings');
+                console.log('API: Directly processing email rules with data:', JSON.stringify({
+                  formId,
+                  submissionId: submission.id,
+                  formDataKeys: Object.keys(mappedData)
+                }));
+                
+                // Make a direct call to the email processing API using axios
+                // This ensures we're making a proper HTTP request even from server-side
+                // Force localhost in development mode, regardless of .env settings
+                const baseUrl = process.env.NODE_ENV === 'development' 
+                  ? `http://localhost:${process.env.PORT || 3000}`
+                  : process.env.NEXT_PUBLIC_BASE_URL;
+                
+                addApiLog(`Using base URL for email processing: ${baseUrl}`, 'info', 'bookings');
+                
+                const emailResponse = await axios.post(
+                  `${baseUrl}/api/emails/process-submission`,
+                  {
+                    formId,
+                    formData: mappedData,
+                    submissionId: submission.id
+                  },
+                  {
+                    headers: {
+                      'Content-Type': 'application/json'
+                    }
+                  }
+                );
+                
+                addApiLog(`Email processing response status: ${emailResponse.status}`, 'success', 'bookings');
+                addApiLog(`Email processing result: ${JSON.stringify(emailResponse.data)}`, 'success', 'bookings');
+                if (process.env.NODE_ENV !== 'production') {
+                  console.log('API: Email processing response status:', emailResponse.status);
+                }
+                if (process.env.NODE_ENV !== 'production') {
+                  console.log('API: Email processing result:', JSON.stringify(emailResponse.data));
+                }
+              } catch (emailError) {
+                addApiLog(`Error processing email rules: ${emailError instanceof Error ? emailError.message : 'Unknown error'}`, 'error', 'bookings');
+                console.error('API: Error processing email rules:', emailError);
+                // Log detailed error information
+                if (emailError instanceof Error) {
+                  console.error('API: Email error details:', {
+                    message: emailError.message,
+                    stack: emailError.stack,
+                  });
+                }
+                // Continue even if email processing fails
+              }
+              
+              // Fetch the updated booking with the new submission
+              const updatedBooking = await prisma.booking.findUnique({
+                where: { id: booking.id },
+                include: {
+                  form: true,
+                  submissions: true,
+                  // Use type assertion to bypass TypeScript's type checking
+                  // @ts-ignore - 'invoices' exists in the Prisma schema but TypeScript doesn't recognize it yet
+                  invoices: true
+                }
+              } as any);
+              
+              if (!updatedBooking) {
+                addApiLog(`Warning: Could not find updated booking with ID: ${booking.id}`, 'info', 'bookings');
+                return res.status(201).json({
+                  ...booking,
+                  submissionId: submission.id
+                });
+              }
+              
+              addApiLog(`Booking updated with submission: ${updatedBooking.id}`, 'success', 'bookings');
+              if (process.env.NODE_ENV !== 'production') {
+                console.log('API: Successfully created booking with submission:', booking.id);
+              }
+              return res.status(201).json({
+                ...updatedBooking,
+                submissionId: submission.id
+              });
+            } catch (submissionError) {
+              addApiLog(`Error creating submission: ${submissionError instanceof Error ? submissionError.message : 'Unknown error'}`, 'error', 'bookings');
+              console.error('API: Error creating submission:', submissionError);
+              // Continue even if submission creation fails
+              // We already have the booking created
+            }
+          }
+
+          return res.status(201).json(booking);
+        } catch (error) {
+          addApiLog(`Error creating booking: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'bookings');
+          console.error('API: Error creating booking:', error);
+          return res.status(500).json({ error: 'Failed to create booking: ' + (error as Error).message });
+        }
+
+      case 'PUT':
+        try {
+          const { id, ...updateData } = req.body;
+
+          if (!id) {
+            addApiLog('Missing booking ID', 'error', 'bookings');
+            return res.status(400).json({ error: 'Missing booking ID' });
+          }
+
+          // If date is provided, ensure it's a Date object
+          if (updateData.date) {
+            updateData.date = new Date(updateData.date);
+          }
+
+          const booking = await prisma.booking.update({
+            where: { id },
+            data: updateData,
+            include: {
+              form: true,
+              submissions: true,
+              invoices: true
+            }
+          });
+
+          addApiLog(`Booking updated with ID: ${booking.id}`, 'success', 'bookings');
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('API: Successfully updated booking:', booking.id);
+          }
+          return res.status(200).json(booking);
+        } catch (error) {
+          addApiLog(`Error updating booking: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'bookings');
+          console.error('API: Error updating booking:', error);
+          return res.status(500).json({ error: 'Failed to update booking: ' + (error as Error).message });
+        }
+
+      default:
+        res.setHeader('Allow', ['GET', 'POST', 'PUT']);
+        return res.status(405).json({ error: `Method ${req.method} Not Allowed` });
+    }
+  } catch (error) {
+    addApiLog(`Error retrieving bookings: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'bookings');
+    console.error('API: Error fetching bookings:', error);
+    return res.status(500).json({ 
+      error: 'Failed to fetch bookings', 
+      details: error instanceof Error ? error.message : 'Unknown error' 
+    });
+  }
+}

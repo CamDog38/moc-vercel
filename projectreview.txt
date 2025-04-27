@@ -1,0 +1,922 @@
+# Email System Fixes Documentation
+
+This document provides a comprehensive explanation of the fixes implemented for the inquiry form, booking form, email rules, and variable replacement functionality in the email processing system.
+
+## Table of Contents
+1. [Inquiry Form Processing](#inquiry-form-processing)
+2. [Booking Form Processing](#booking-form-processing)
+3. [Email Rules Processing](#email-rules-processing)
+4. [Variable Replacement](#variable-replacement)
+5. [JSON Data Handling](#json-data-handling)
+6. [Emergency Fixes](#emergency-fixes)
+
+## Inquiry Form Processing
+
+### Overview
+The inquiry form processing system was fixed to properly handle form submissions and create leads with correct data mapping. The key issues addressed were:
+
+1. Form submissions not properly triggering email processing
+2. Lead creation failing due to incorrect field mapping
+3. Name fields not being properly extracted from form data
+
+### Key Files
+- `/src/pages/forms/[id]/view.tsx` - Public form view page
+- `/src/lib/forms2/services/submission/leadService.ts` - Lead creation service
+- `/src/lib/forms2/services/submission/submissionService2.ts` - Form submission processing
+- `/src/lib/forms2/services/mapping.ts` - Field mapping utilities
+
+### Fixes Implemented
+
+#### 1. Form Submission to Email Processing Flow
+
+We fixed the connection between form submissions and email processing by updating the API endpoints to properly call the email processing API after creating a submission:
+
+```typescript
+// In /src/pages/forms/[id]/view.tsx
+// Updated to call the email processing API after form submission
+
+// For inquiry forms, we need name and email
+if (form.type === 'INQUIRY') {
+  try {
+    // Submit the form data
+    const response = await axios.post('/api/submissions', {
+      formId: form.id,
+      data: formData,
+    });
+    
+    if (response.data.id) {
+      // Process emails for this submission
+      await axios.post('/api/emails/process-submission', {
+        submissionId: response.data.id,
+      });
+      
+      console.log('Form submitted and emails processed successfully');
+    }
+  } catch (error) {
+    console.error('Error submitting form:', error);
+  }
+}
+```
+
+#### 2. Lead Creation from Form Data
+
+We improved the lead creation process to better extract name, email, and phone from form submissions:
+
+```typescript
+// In /src/lib/forms2/services/submission/leadService.ts
+
+export const createLeadFromFormData = async (
+  formId: string,
+  mappedData: Record<string, any>,
+  formData: Record<string, any>
+): Promise<string> => {
+  // Extract email, name, and phone from the mapped data
+  let email = mappedData.email || null;
+  let name = mappedData.name || null;
+  let phone = mappedData.phone || null;
+  
+  // Look for firstName and lastName in both mappedData and raw formData
+  let firstName = mappedData.firstName || null;
+  let lastName = mappedData.lastName || null;
+  
+  // Check raw form data for first_name and last_name fields
+  if (!firstName && formData.first_name) {
+    firstName = formData.first_name;
+  }
+  
+  if (!lastName && formData.last_name) {
+    lastName = formData.last_name;
+  }
+  
+  // Always prioritize firstName + lastName combination over name
+  if (firstName && lastName) {
+    name = `${firstName} ${lastName}`;
+  } else if (firstName) {
+    name = firstName;
+  } else if (lastName) {
+    name = lastName;
+  }
+  
+  // Create lead with mapped or extracted data
+  const lead = await prisma.lead.create({
+    data: {
+      email,
+      name,
+      phone,
+      source: 'public_form',
+      formId,
+      status: 'NEW',
+    },
+  });
+  
+  return lead.id;
+};
+```
+
+## Booking Form Processing
+
+### Overview
+The booking form processing system was fixed to properly handle form submissions and create bookings with correct data mapping. The key issues addressed were:
+
+1. Booking form submissions not properly triggering email processing
+2. Booking data not being correctly associated with leads
+3. Form field mapping issues for booking-specific fields
+
+### Key Files
+- `/src/pages/forms/[id]/view.tsx` - Public form view page
+- `/src/lib/forms2/services/submission/bookingService.ts` - Booking creation service
+- `/src/lib/forms2/services/submission/submissionService2.ts` - Form submission processing
+
+### Fixes Implemented
+
+#### 1. Booking Form Submission Flow
+
+We fixed the booking form submission flow to properly create bookings and trigger email processing:
+
+```typescript
+// In /src/pages/forms/[id]/view.tsx
+// Updated to handle booking form submissions
+
+// For booking forms, we need to create a booking
+if (form.type === 'BOOKING') {
+  try {
+    // Submit the form data
+    const response = await axios.post('/api/bookings', {
+      formId: form.id,
+      data: formData,
+    });
+    
+    if (response.data.id) {
+      // Process emails for this booking
+      await axios.post('/api/emails/process-submission', {
+        submissionId: response.data.submissionId,
+        bookingId: response.data.id,
+      });
+      
+      console.log('Booking created and emails processed successfully');
+    }
+  } catch (error) {
+    console.error('Error creating booking:', error);
+  }
+}
+```
+
+## Email Rules Processing
+
+### Overview
+The email rules processing system was fixed to properly evaluate conditions and trigger emails based on form submissions. The key issues addressed were:
+
+1. Rule conditions not being properly evaluated
+2. Rule conditions not being saved correctly in the database
+3. Email templates not being correctly associated with rules
+4. Email queue processing causing system instability
+
+### Key Files
+- `/src/lib/forms2/services/email-processing/ruleService2.ts` - Email rule processing
+- `/src/lib/forms2/services/email-processing/emailService2.ts` - Email sending service
+- `/src/pages/api/emails/process-submission.ts` - API endpoint for processing emails
+
+### Fixes Implemented
+
+#### 1. Email Rule Condition Saving
+
+We fixed issues with rule conditions not being saved correctly in the database. The problem was in the EditEmailRuleForm component where conditions were not being properly formatted before saving:
+
+```typescript
+// In /src/components/emails/rules/EditEmailRuleForm.tsx
+
+const handleSave = async () => {
+  setIsSaving(true);
+  
+  try {
+    // Ensure conditions are properly formatted before saving
+    const formattedConditions = conditions.map(condition => {
+      // Make sure each condition has all required fields
+      return {
+        field: condition.field || '',
+        operator: condition.operator || 'equals',
+        value: condition.value || '',
+        // Convert to proper JSON format if needed
+        ...(typeof condition === 'string' ? JSON.parse(condition) : {})
+      };
+    });
+    
+    // Create a properly formatted rule object
+    const ruleData = {
+      name: ruleName,
+      formId,
+      templateId,
+      conditions: formattedConditions,
+      active: isActive,
+    };
+    
+    // Save the rule
+    const response = await axios.post('/api/email-rules', ruleData);
+    
+    if (response.status === 200) {
+      toast.success('Email rule saved successfully');
+      router.push('/dashboard/email-rules');
+    }
+  } catch (error) {
+    console.error('Error saving email rule:', error);
+    toast.error('Error saving email rule');
+  } finally {
+    setIsSaving(false);
+  }
+};
+```
+
+#### 2. Condition Component Improvements
+
+We also fixed the ConditionItem component to properly handle condition changes and maintain state consistency:
+
+```typescript
+// In /src/components/emails/rules/ConditionItem.tsx
+
+const ConditionItem = ({ condition, index, onChange, onRemove, fields }) => {
+  // Handle field change
+  const handleFieldChange = (e) => {
+    const newCondition = { ...condition, field: e.target.value };
+    onChange(index, newCondition);
+  };
+  
+  // Handle operator change
+  const handleOperatorChange = (e) => {
+    const newCondition = { ...condition, operator: e.target.value };
+    onChange(index, newCondition);
+  };
+  
+  // Handle value change
+  const handleValueChange = (e) => {
+    const newCondition = { ...condition, value: e.target.value };
+    onChange(index, newCondition);
+  };
+  
+  return (
+    <div className="condition-item">
+      <select value={condition.field} onChange={handleFieldChange}>
+        <option value="">Select Field</option>
+        {fields.map((field) => (
+          <option key={field.id} value={field.id}>
+            {field.label}
+          </option>
+        ))}
+      </select>
+      
+      <select value={condition.operator} onChange={handleOperatorChange}>
+        <option value="equals">Equals</option>
+        <option value="contains">Contains</option>
+        <option value="greaterThan">Greater Than</option>
+        <option value="lessThan">Less Than</option>
+      </select>
+      
+      <input
+        type="text"
+        value={condition.value || ''}
+        onChange={handleValueChange}
+        placeholder="Value"
+      />
+      
+      <button type="button" onClick={() => onRemove(index)}>
+        Remove
+      </button>
+    </div>
+  );
+};
+```
+
+
+## Lead Submission and Name Handling
+
+### Overview
+The lead submission process was fixed to properly handle form submissions and create leads with correct name combinations. The key issues addressed were:
+
+1. Form submissions not correctly extracting first and last names
+2. Lead creation failing to combine name components properly
+3. Inconsistent name formats between form submissions and the lead table
+4. Missing or incorrect data in the lead table after form submission
+
+### Key Files
+- `/src/lib/forms2/services/submission/leadService.ts` - Lead creation service
+- `/src/lib/forms2/services/submission/submissionService2.ts` - Form submission processing
+- `/src/lib/forms2/services/mapping.ts` - Field mapping utilities
+- `/src/pages/forms/[id]/view.tsx` - Public form view page
+
+### Fixes Implemented
+
+#### 1. Intelligent Name Field Detection
+
+We implemented a robust system to detect and extract name fields from form submissions, handling various field naming conventions:
+
+```typescript
+// In /src/lib/forms2/services/submission/leadService.ts
+
+// Extract email, name, and phone from the mapped data
+let email = mappedData.email || null;
+let name = mappedData.name || null;
+let phone = mappedData.phone || null;
+
+// Look for firstName and lastName in both mappedData and raw formData
+let firstName = mappedData.firstName || null;
+let lastName = mappedData.lastName || null;
+
+// Check raw form data for first_name and last_name fields
+if (!firstName && formData.first_name) {
+  firstName = formData.first_name;
+  console.log(`[LEAD SERVICE] Found firstName in raw form data: "${firstName}"`);
+}
+
+if (!lastName && formData.last_name) {
+  lastName = formData.last_name;
+  console.log(`[LEAD SERVICE] Found lastName in raw form data: "${lastName}"`);
+}
+
+// Also check for fields with specific field IDs that might contain first name and last name
+for (const [key, value] of Object.entries(formData)) {
+  if (!value || typeof value !== 'string') continue;
+  
+  // Check for field labels that might indicate first name or last name
+  if (!firstName) {
+    if (key.includes('first') || key.toLowerCase().includes('firstname')) {
+      firstName = value;
+      console.log(`[LEAD SERVICE] Found firstName in field ${key}: "${firstName}"`);
+    }
+  }
+  
+  if (!lastName) {
+    if (key.includes('last') || key.toLowerCase().includes('lastname')) {
+      lastName = value;
+      console.log(`[LEAD SERVICE] Found lastName in field ${key}: "${lastName}"`);
+    }
+  }
+}
+```
+
+#### 2. Smart Name Combination Logic
+
+We improved the name combination logic to prioritize firstName + lastName combinations over single name fields:
+
+```typescript
+// In /src/lib/forms2/services/submission/leadService.ts
+
+// Always prioritize firstName + lastName combination over name
+if (firstName && lastName) {
+  name = `${firstName} ${lastName}`;
+  console.log(`[LEAD SERVICE] Combined firstName and lastName into name: "${name}"`);
+} else if (firstName) {
+  name = firstName;
+  console.log(`[LEAD SERVICE] Using firstName as name: "${name}"`);
+} else if (lastName) {
+  name = lastName;
+  console.log(`[LEAD SERVICE] Using lastName as name: "${name}"`);
+}
+
+// One more check - look for first and last name in the form data directly by field label
+if ((!firstName || !lastName) && !name.includes(' ')) {
+  for (const [key, value] of Object.entries(formData)) {
+    if (!value || typeof value !== 'string') continue;
+    
+    // Look for fields with labels that might indicate first name or last name
+    const keyLower = key.toLowerCase();
+    if (keyLower.includes('first') && keyLower.includes('name') && !firstName) {
+      firstName = value;
+      console.log(`[LEAD SERVICE] Found firstName by label in field ${key}: "${firstName}"`);
+    } else if (keyLower.includes('last') && keyLower.includes('name') && !lastName) {
+      lastName = value;
+      console.log(`[LEAD SERVICE] Found lastName by label in field ${key}: "${lastName}"`);
+    }
+  }
+  
+  // If we found both first and last name, combine them
+  if (firstName && lastName && !name.includes(' ')) {
+    name = `${firstName} ${lastName}`;
+    console.log(`[LEAD SERVICE] Updated name with newly found first and last name: "${name}"`);
+  }
+}
+```
+
+#### 3. Lead Table Submission with Correct Data
+
+We fixed the lead creation process to ensure all data is correctly submitted to the lead table:
+
+```typescript
+// In /src/lib/forms2/services/submission/leadService.ts
+
+// Final check - log the data we're about to use for creating the lead
+console.log(`[LEAD SERVICE] FINAL DATA for lead creation:`, {
+  email,
+  name,
+  phone,
+  source: 'public_form',
+  formId
+});
+
+// Create lead with mapped or extracted data
+const lead = await prisma.lead.create({
+  data: {
+    email,
+    name,
+    phone,
+    source: 'public_form',
+    formId,
+    status: 'NEW',
+  },
+});
+
+logger.info(`Lead created: ${lead.id}`, 'forms');
+console.log(`[LEAD SERVICE] Lead created with ID: ${lead.id}, name: "${lead.name}"`);
+```
+
+#### 4. Form Submission to Lead Creation Flow
+
+We improved the connection between form submissions and lead creation:
+
+```typescript
+// In /src/lib/forms2/services/submission/submissionService2.ts
+
+// Create a lead if this is an inquiry form
+if (form.type === 'INQUIRY') {
+  logger.info(`Creating lead for inquiry form: ${formId}`, 'forms');
+  
+  try {
+    // Create a lead from the form data
+    const leadId = await createLeadFromFormData(formId, mappedData, formData);
+    
+    // Update the submission with the lead ID
+    if (leadId) {
+      await prisma.formSubmission.update({
+        where: { id: submissionId },
+        data: { leadId },
+      });
+      
+      logger.info(`Updated submission ${submissionId} with lead ID ${leadId}`, 'forms');
+    }
+  } catch (error) {
+    logger.error(`Error creating lead: ${error}`, 'forms');
+  }
+}
+```
+
+## Variable Replacement
+
+### Overview
+The variable replacement system was fixed to properly handle form submission data and replace variables in email templates. The key issues addressed were:
+
+1. Variables not being properly replaced in email templates
+2. Form submission data not being correctly mapped to variables
+3. Lead data not being correctly used for variable replacement
+
+### Key Files
+- `/src/lib/forms2/services/email-processing/variableService2.ts` - Variable replacement service
+- `/src/lib/forms2/services/email-processing/emailService2.ts` - Email processing service
+- `/src/util/email-template-helpers.ts` - Legacy variable replacement helpers
+
+### Fixes Implemented
+
+#### 1. Variable Replacement in Email Templates
+
+We fixed the variable replacement to properly handle different data formats and nested objects:
+
+```typescript
+// In /src/lib/forms2/services/email-processing/variableService2.ts
+
+export function replaceVariables2(text: string, data: Record<string, any>): string {
+  if (!text) return '';
+  
+  // Create an enhanced data object with common variable mappings
+  const enhancedData: EnhancedData = { ...data };
+  
+  // Find all variables in the text using regex
+  const variableRegex = /{{([^{}]+)}}/g;
+  const matches = text.match(variableRegex);
+  
+  if (matches) {
+    // Replace each variable with its value
+    matches.forEach(match => {
+      // Extract variable name without the curly braces
+      const variableName = match.substring(2, match.length - 2);
+      
+      // Find the value for the variable
+      let value = findVariableValue(variableName, enhancedData);
+      
+      // Replace the variable with its value
+      if (value !== undefined) {
+        text = text.replace(match, value);
+      }
+    });
+  }
+  
+  return text;
+}
+```
+
+#### 2. Finding Variable Values
+
+We improved the variable value lookup to handle special cases like firstName extraction:
+
+```typescript
+// In /src/lib/forms2/services/email-processing/variableService2.ts
+
+function findVariableValue(variableName: string, data: EnhancedData): string | undefined {
+  // Check if the variable exists directly in the data
+  if (data[variableName] !== undefined) {
+    return String(data[variableName] || '');
+  }
+  
+  // Handle special case for firstName
+  if (variableName === 'firstName') {
+    // First check if firstName is already in the data
+    if (data.firstName) {
+      return String(data.firstName);
+    }
+    
+    // Try to extract first name from name field
+    if (data.name) {
+      const firstName = data.name.split(' ')[0];
+      return firstName;
+    }
+    
+    // Try to extract username from email as a last resort
+    if (data.email) {
+      const username = data.email.split('@')[0];
+      return username;
+    }
+    
+    // Default fallback
+    return 'Customer';
+  }
+  
+  // Handle other common variables
+  if (variableName === 'email' && data.email) {
+    return String(data.email);
+  }
+  
+  if (variableName === 'name' && data.name) {
+    return String(data.name);
+  }
+  
+  // Return undefined if no value is found
+  return undefined;
+}
+```
+
+## JSON Data Handling
+
+### Overview
+The JSON data handling in the email system was fixed to properly parse and process form submission data. The key issues addressed were:
+
+1. JSON parsing errors when handling form submission data
+2. Inconsistent data formats between different parts of the system
+3. Data type conversion issues when processing form data
+
+### Key Files
+- `/src/lib/forms2/services/submission/submissionService2.ts` - Form submission processing
+- `/src/lib/forms2/services/email-processing/emailService2.ts` - Email processing service
+- `/src/pages/api/emails/process-submission.ts` - API endpoint for processing emails
+
+### Fixes Implemented
+
+#### 1. Form Submission Data Parsing
+
+We fixed the form submission data parsing to handle different JSON formats:
+
+```typescript
+// In /src/lib/forms2/services/submission/submissionService2.ts
+
+function parseFormData(data: any): Record<string, any> {
+  // If data is already an object, return it
+  if (typeof data === 'object' && data !== null && !Array.isArray(data)) {
+    return data;
+  }
+  
+  // If data is a string, try to parse it as JSON
+  if (typeof data === 'string') {
+    try {
+      return JSON.parse(data);
+    } catch (error) {
+      console.error('Error parsing form data:', error);
+      return {};
+    }
+  }
+  
+  // Default to empty object
+  return {};
+}
+```
+
+#### 2. Email Template Data Preparation
+
+We improved the email template data preparation to ensure consistent data formats:
+
+```typescript
+// In /src/lib/forms2/services/email-processing/emailService2.ts
+
+function prepareTemplateData(submission: any): Record<string, any> {
+  // Parse submission data if it's a string
+  const submissionData = typeof submission.data === 'string'
+    ? JSON.parse(submission.data)
+    : submission.data || {};
+  
+  // Create a base data object
+  const data: Record<string, any> = {
+    ...submissionData,
+    submissionId: submission.id,
+    formId: submission.formId,
+  };
+  
+  // Add lead data if available
+  if (submission.leadId) {
+    data.leadId = submission.leadId;
+  }
+  
+  // Add booking data if available
+  if (submission.bookingId) {
+    data.bookingId = submission.bookingId;
+  }
+  
+  return data;
+}
+```
+
+
+```
+
+
+## Form Editing and Saving Issues
+
+### Overview
+We fixed several issues related to form editing and saving functionality. The key issues addressed were:
+
+1. Form data not being properly saved when editing forms
+2. Form field configurations being lost during save operations
+3. Race conditions causing data corruption during form saves
+4. UI not reflecting the latest form state after edits
+
+### Key Files
+- `/src/pages/dashboard/forms/[id]/edit.tsx` - Form editing page
+- `/src/components/forms2/FormBuilder.tsx` - Form builder component
+- `/src/components/forms2/FormBuilderSettings.tsx` - Form settings component
+- `/src/pages/api/forms/[id]/index.ts` - Form API endpoint
+
+### Fixes Implemented
+
+#### 1. Form Save Operation Improvements
+
+We fixed the form save operation to properly handle all form data and prevent race conditions:
+
+```typescript
+// In /src/pages/dashboard/forms/[id]/edit.tsx
+
+const saveForm = async (formData: any) => {
+  setIsSaving(true);
+  
+  try {
+    // Create a deep copy of the form data to prevent reference issues
+    const formDataCopy = JSON.parse(JSON.stringify(formData));
+    
+    // Ensure fields are properly formatted
+    if (formDataCopy.fields) {
+      formDataCopy.fields = formDataCopy.fields.map((field: any) => {
+        // Make sure options are properly formatted for select/dropdown fields
+        if (field.type === 'select' || field.type === 'dropdown') {
+          if (typeof field.options === 'string') {
+            try {
+              field.options = JSON.parse(field.options);
+            } catch (e) {
+              // If parsing fails, convert to array format
+              field.options = field.options.split(',').map((opt: string) => ({
+                label: opt.trim(),
+                value: opt.trim().toLowerCase().replace(/\s+/g, '_')
+              }));
+            }
+          }
+        }
+        return field;
+      });
+    }
+    
+    // Save the form data
+    const response = await axios.put(`/api/forms/${formId}`, formDataCopy);
+    
+    if (response.status === 200) {
+      toast.success('Form saved successfully');
+      // Update the form data in state to reflect the latest changes
+      setForm(response.data);
+    }
+  } catch (error) {
+    console.error('Error saving form:', error);
+    toast.error('Error saving form');
+  } finally {
+    setIsSaving(false);
+  }
+};
+```
+
+#### 2. Form Field Validation
+
+We improved the form field validation to ensure all required data is present before saving:
+
+```typescript
+// In /src/components/forms2/FormBuilder.tsx
+
+const validateField = (field: any) => {
+  const errors: string[] = [];
+  
+  if (!field.id) errors.push('Field ID is required');
+  if (!field.label) errors.push('Field label is required');
+  if (!field.type) errors.push('Field type is required');
+  
+  // Validate options for select/dropdown fields
+  if ((field.type === 'select' || field.type === 'dropdown') && (!field.options || field.options.length === 0)) {
+    errors.push('Options are required for select/dropdown fields');
+  }
+  
+  return errors;
+};
+
+const validateForm = () => {
+  let isValid = true;
+  const fieldErrors: Record<string, string[]> = {};
+  
+  // Validate each field
+  form.fields.forEach((field: any) => {
+    const errors = validateField(field);
+    if (errors.length > 0) {
+      fieldErrors[field.id] = errors;
+      isValid = false;
+    }
+  });
+  
+  setErrors(fieldErrors);
+  return isValid;
+};
+```
+
+## Select and Dropdown Component Issues
+
+### Overview
+We fixed issues related to select and dropdown components in forms. The key issues addressed were:
+
+1. Inconsistent data formats between select and dropdown components
+2. Options not being properly saved or displayed in the form builder
+3. Selected values not being correctly captured in form submissions
+4. Compatibility issues between different UI libraries for select components
+
+### Key Files
+- `/src/components/forms2/fields/SelectField.tsx` - Select field component
+- `/src/components/forms2/fields/DropdownField.tsx` - Dropdown field component
+- `/src/components/forms2/FormBuilder.tsx` - Form builder component
+- `/src/lib/forms2/services/submission/submissionService2.ts` - Form submission processing
+
+### Fixes Implemented
+
+#### 1. Standardized Options Format
+
+We standardized the format for select and dropdown options across the system:
+
+```typescript
+// In /src/components/forms2/fields/SelectField.tsx
+
+interface SelectOption {
+  label: string;
+  value: string;
+}
+
+const normalizeOptions = (options: any): SelectOption[] => {
+  if (!options) return [];
+  
+  // If options is a string, try to parse it as JSON
+  if (typeof options === 'string') {
+    try {
+      return JSON.parse(options);
+    } catch (e) {
+      // If parsing fails, split by comma and format
+      return options.split(',').map((opt: string) => ({
+        label: opt.trim(),
+        value: opt.trim().toLowerCase().replace(/\s+/g, '_')
+      }));
+    }
+  }
+  
+  // If options is an array of strings, convert to SelectOption format
+  if (Array.isArray(options) && options.length > 0 && typeof options[0] === 'string') {
+    return options.map((opt: string) => ({
+      label: opt.trim(),
+      value: opt.trim().toLowerCase().replace(/\s+/g, '_')
+    }));
+  }
+  
+  // If options is already in the correct format, return as is
+  if (Array.isArray(options) && options.length > 0 && typeof options[0] === 'object') {
+    return options;
+  }
+  
+  return [];
+};
+```
+
+#### 2. Consistent Value Handling
+
+We improved the value handling for select and dropdown components to ensure consistency:
+
+```typescript
+// In /src/components/forms2/fields/SelectField.tsx
+
+const handleChange = (selectedOption: any) => {
+  // Handle both single and multi-select
+  let value;
+  
+  if (field.multiple) {
+    // For multi-select, store an array of values
+    value = selectedOption ? selectedOption.map((opt: any) => opt.value) : [];
+  } else {
+    // For single select, store just the value
+    value = selectedOption ? selectedOption.value : null;
+  }
+  
+  // Update the form data
+  onChange({
+    target: {
+      name: field.id,
+      value: value
+    }
+  });
+};
+```
+
+#### 3. Form Builder Integration
+
+We fixed the integration between the form builder and select/dropdown components:
+
+```typescript
+// In /src/components/forms2/FormBuilder.tsx
+
+const renderFieldOptions = (field: any) => {
+  if (field.type !== 'select' && field.type !== 'dropdown') return null;
+  
+  return (
+    <div className="field-options">
+      <label>Options</label>
+      <div className="options-list">
+        {field.options.map((option: any, index: number) => (
+          <div key={index} className="option-item">
+            <input
+              type="text"
+              value={option.label}
+              onChange={(e) => updateOptionLabel(field.id, index, e.target.value)}
+              placeholder="Option label"
+            />
+            <input
+              type="text"
+              value={option.value}
+              onChange={(e) => updateOptionValue(field.id, index, e.target.value)}
+              placeholder="Option value"
+            />
+            <button type="button" onClick={() => removeOption(field.id, index)}>
+              Remove
+            </button>
+          </div>
+        ))}
+        <button type="button" onClick={() => addOption(field.id)}>
+          Add Option
+        </button>
+      </div>
+    </div>
+  );
+};
+
+const addOption = (fieldId: string) => {
+  setForm((prevForm: any) => {
+    const updatedFields = prevForm.fields.map((field: any) => {
+      if (field.id === fieldId) {
+        return {
+          ...field,
+          options: [
+            ...field.options,
+            { label: 'New Option', value: 'new_option' }
+          ]
+        };
+      }
+      return field;
+    });
+    
+    return {
+      ...prevForm,
+      fields: updatedFields
+    };
+  });
+};
+```
+
+## Conclusion
+
+The fixes implemented address the key issues with the email processing system, particularly around form submissions, lead creation, email rules, and variable replacement. We also fixed important issues related to form editing, saving, and select/dropdown components. The emergency fixes have stabilized the system by disabling problematic endpoints, while the long-term fixes have improved the robustness of the email processing pipeline.
+
+To fully rebuild the email processing system, we recommend:
+
+1. Implementing proper throttling mechanisms for all email-related API endpoints
+2. Using database-based tracking for processing state instead of in-memory variables
+3. Adding comprehensive error handling and logging throughout the email processing pipeline
+4. Implementing proper unit and integration tests for the email processing system
+5. Standardizing form field components and their data formats
+6. Improving the form builder UI to prevent configuration errors

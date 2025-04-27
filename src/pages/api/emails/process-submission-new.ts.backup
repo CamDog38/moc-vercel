@@ -1,0 +1,452 @@
+import { NextApiRequest, NextApiResponse } from 'next';
+import prisma from '@/lib/prisma';
+import { addApiLog } from '../debug/logs';
+import { evaluateConditions } from '@/util/email-rules';
+import { mapFieldIds } from '@/util/field-id-mapper';
+import { processEmailAsync } from './process-async-new';
+
+// Import our new email processing utilities
+import {
+  getTemplate,
+  getTemplateId,
+  getCcEmails,
+  getBccEmails,
+  getRecipientType,
+  getRecipientEmail,
+  getRecipientField,
+  isValidEmail,
+  isFormSystem2,
+  extractFieldMappings
+} from '@/util/email-processing';
+
+/**
+ * API handler for processing email submissions
+ * Enhanced to properly handle Form System 2.0 emails with CC/BCC recipients
+ */
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // Add a clear identifier log
+  console.log('==========================================');
+  console.log('[EMAILS] NEW process-submission-new.ts API CALLED');
+  console.log('==========================================');
+  addApiLog('NEW process-submission-new.ts API CALLED', 'info', 'emails');
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { formId, formData = {}, submissionId } = req.body;
+
+    // Validate required fields
+    if (!formId) {
+      return res.status(400).json({ error: 'Missing formId' });
+    }
+
+    // Log the request details
+    addApiLog(`Processing email rules for form ${formId}${submissionId ? `, submission ${submissionId}` : ''}`, 'info', 'emails');
+    console.log('[Forms2] Processing email rules for form', formId, 'submission', submissionId || 'new');
+
+    // Log available form data keys
+    addApiLog(`Form data keys: ${Object.keys(formData).join(', ')}`, 'info', 'emails');
+    console.log('[Forms2] Form data keys:', Object.keys(formData).join(', '));
+
+    // Check if this is a Form System 2.0 form
+    let isFormSystem2Form = false;
+    
+    // Check form ID format (Form System 2.0 IDs start with 'cm')
+    if (formId && typeof formId === 'string' && formId.startsWith('cm')) {
+      isFormSystem2Form = true;
+      addApiLog(`Form identified as 2.0 form based on ID format: ${formId}`, 'info', 'emails');
+      console.log('[Forms] Form ID format check:', formId);
+    }
+    
+    // Check submission source if available
+    if (req.body.source === 'forms2-api') {
+      isFormSystem2Form = true;
+      addApiLog(`Form identified as 2.0 form based on submission source: ${req.body.source}`, 'info', 'emails');
+      console.log('[Forms] Form identified as 2.0 form based on submission source:', req.body.source);
+    }
+    
+    // Log Form System version
+    addApiLog(`Is Form System 2.0: ${isFormSystem2Form}`, 'info', 'emails');
+    console.log('[Forms] Is Form System 2.0:', isFormSystem2Form);
+
+    // Get the form
+    const form = await prisma.form.findUnique({
+      where: { id: formId }
+    });
+
+    if (!form) {
+      addApiLog(`Form not found: ${formId}`, 'error', 'emails');
+      return res.status(404).json({ error: 'Form not found' });
+    }
+
+    // Get email rules for the form
+    const emailRules = await prisma.emailRule.findMany({
+      where: { formId: form.id },
+      include: {
+        template: true
+      }
+    });
+
+    if (emailRules.length === 0) {
+      addApiLog(`No email rules found for form: ${formId}`, 'info', 'emails');
+      return res.status(200).json({ message: 'No email rules found' });
+    }
+
+    addApiLog(`Found ${emailRules.length} email rules for form: ${formId}`, 'info', 'emails');
+    
+    // Log detailed information about each rule and its template
+    emailRules.forEach((rule, index) => {
+      addApiLog(`Email rule ${index + 1} details:`, 'info', 'emails');
+      addApiLog(`- Rule ID: ${rule.id}`, 'info', 'emails');
+      addApiLog(`- Rule name: ${rule.name}`, 'info', 'emails');
+      
+      // Log template details
+      const template = getTemplate(rule);
+      if (template) {
+        addApiLog(`- Template ID: ${template.id}`, 'info', 'emails');
+        addApiLog(`- Template name: ${template.name}`, 'info', 'emails');
+        addApiLog(`- Template CC emails: ${template.ccEmails || 'none'}`, 'info', 'emails');
+        addApiLog(`- Template BCC emails: ${template.bccEmails || 'none'}`, 'info', 'emails');
+      } else {
+        addApiLog(`- No template found for rule`, 'error', 'emails');
+      }
+    });
+
+    // Use existing submission or create a new one
+    let submission;
+    if (submissionId) {
+      submission = await prisma.formSubmission.findUnique({
+        where: { id: submissionId }
+      });
+
+      if (!submission) {
+        addApiLog(`Submission not found: ${submissionId}`, 'error', 'emails');
+        return res.status(404).json({ error: 'Submission not found' });
+      }
+
+      addApiLog(`Using existing submission: ${submission.id}`, 'info', 'emails');
+    } else {
+      // Create a new submission
+      submission = await prisma.formSubmission.create({
+        data: {
+          formId: form.id,
+          data: formData,
+          timeStamp: Date.now().toString()
+        }
+      });
+
+      addApiLog(`Created new submission: ${submission.id}`, 'info', 'emails');
+    }
+
+    // Update submission with timestamp if needed
+    if (submission && !submission.timeStamp) {
+      // If submission exists but doesn't have a timeStamp, add one
+      const timeStamp = Date.now().toString();
+      submission = await prisma.formSubmission.update({
+        where: { id: submission.id },
+        data: { timeStamp: timeStamp },
+      });
+      addApiLog(`Updated existing submission ${submission.id} with timeStamp: ${timeStamp}`, 'info', 'emails');
+    }
+
+    // Create field mappings from form structure
+    const formDataWithMappings = await extractFieldMappings(form.id, formData);
+
+    // Log available form data keys
+    addApiLog(`Available form data keys: ${Object.keys(formDataWithMappings).join(', ')}`, 'info', 'emails');
+
+    // Process each email rule
+    const results = await Promise.all(
+      emailRules.map(async (rule) => {
+        // Log the rule details for debugging
+        addApiLog(`Processing email rule: ${rule.name}`, 'info', 'emails');
+        addApiLog(`Rule details: ${JSON.stringify({
+          id: rule.id,
+          name: rule.name,
+          conditionsType: typeof rule.conditions,
+          conditionsValue: rule.conditions,
+          hasTemplate: !!getTemplate(rule),
+          templateId: getTemplateId(rule),
+          ccEmails: getCcEmails(rule),
+          bccEmails: getBccEmails(rule),
+          recipientType: getRecipientType(rule),
+          recipientEmail: getRecipientEmail(rule),
+          recipientField: getRecipientField(rule)
+        })}`, 'info', 'emails');
+        
+        // Log the full rule object structure
+        console.log('[Forms2] Full rule object:', JSON.stringify(rule, null, 2));
+        
+        // Log the template structure
+        const ruleTemplate = getTemplate(rule);
+        if (ruleTemplate) {
+          console.log('[Forms2] Template structure:', JSON.stringify({
+            id: ruleTemplate.id,
+            name: ruleTemplate.name,
+            ccEmails: ruleTemplate.ccEmails,
+            bccEmails: ruleTemplate.bccEmails,
+            hasSubject: !!ruleTemplate.subject,
+            subject: ruleTemplate.subject && ruleTemplate.subject.substring(0, 50) + '...',
+            hasHtmlContent: !!ruleTemplate.htmlContent
+          }, null, 2));
+        }
+        
+        // Create field mappings from form structure
+        const mappedFormData: Record<string, any> = { ...formData };
+        
+        // Apply field ID mapping to make email rules more robust
+        const mappedData = form ? await mapFieldIds(form.id, mappedFormData) : mappedFormData;
+        addApiLog(`Applied field ID mapping to form data`, 'info', 'emails');
+        
+        // Check if this is a booking confirmation rule
+        const isBookingConfirmation = rule.name?.toLowerCase().includes('booking confirmation') || 
+                                     getTemplate(rule)?.name?.toLowerCase().includes('booking confirmation') ||
+                                     getTemplate(rule)?.type === 'BOOKING_CONFIRMATION';
+        
+        if (isBookingConfirmation && submission.bookingId) {
+          addApiLog(`Detected booking confirmation rule with booking ID: ${submission.bookingId}`, 'info', 'emails');
+          
+          try {
+            // Use the dedicated booking confirmation endpoint
+            const response = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/emails/send-booking-confirmation`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                bookingId: submission.bookingId,
+                templateId: getTemplateId(rule)
+              }),
+            });
+            
+            const result = await response.json();
+            
+            if (response.ok) {
+              addApiLog(`Booking confirmation sent successfully via dedicated endpoint`, 'success', 'emails');
+              return {
+                ruleId: rule.id,
+                sent: true,
+                message: 'Booking confirmation sent successfully',
+                bookingId: submission.bookingId
+              };
+            } else {
+              addApiLog(`Error sending booking confirmation: ${result.error || 'Unknown error'}`, 'error', 'emails');
+              return {
+                ruleId: rule.id,
+                sent: false,
+                message: `Error sending booking confirmation: ${result.error || 'Unknown error'}`,
+                bookingId: submission.bookingId
+              };
+            }
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+            addApiLog(`Exception sending booking confirmation: ${errorMessage}`, 'error', 'emails');
+            return {
+              ruleId: rule.id,
+              sent: false,
+              message: `Exception sending booking confirmation: ${errorMessage}`,
+              bookingId: submission.bookingId
+            };
+          }
+        }
+        
+        // Evaluate conditions
+        let conditionsMet = true;
+        if (rule.conditions) {
+          try {
+            // Pass the formId to enable field mapping
+            const evaluationResult = await evaluateConditions(rule.conditions, mappedData, {
+              logging: true,
+              logFn: (message, level) => addApiLog(message, level === 'error' ? 'error' : level === 'info' ? 'info' : 'success', 'emails'),
+              ruleId: rule.id,
+              formId: form?.id // Use optional chaining here
+            });
+            
+            conditionsMet = evaluationResult.matches;
+            
+            // Log detailed results if conditions were not met
+            if (!conditionsMet && evaluationResult.details) {
+              evaluationResult.details.forEach(detail => {
+                if (!detail.result) {
+                  addApiLog(`Condition failed: ${detail.field} ${detail.operator} ${detail.expectedValue} - ${detail.reason}`, 'info', 'emails');
+                }
+              });
+            }
+          } catch (error) {
+            addApiLog(`Error evaluating conditions: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'emails');
+            conditionsMet = false;
+          }
+        }
+        
+        // Log condition evaluation result
+        addApiLog(`Conditions met: ${conditionsMet}`, 'info', 'emails');
+
+        // Return early if conditions are not met
+        if (!conditionsMet) {
+          return {
+            ruleId: rule.id,
+            sent: false,
+            message: 'Conditions not met',
+          };
+        }
+
+        addApiLog(`Conditions met for rule: ${rule.name}`, 'success', 'emails');
+
+        // Check if template exists
+        if (!getTemplate(rule)) {
+          addApiLog(`No template found for rule: ${rule.name}`, 'error', 'emails');
+          return {
+            ruleId: rule.id,
+            sent: false,
+            message: 'No template found'
+          };
+        }
+
+        // Log template details for debugging
+        const template = getTemplate(rule);
+        if (!template) {
+          addApiLog(`No template found for rule: ${rule.name}`, 'error', 'emails');
+          return {
+            ruleId: rule.id,
+            sent: false,
+            message: 'No template found'
+          };
+        }
+        
+        addApiLog(`Template details: ${JSON.stringify({
+          id: template.id,
+          name: template.name,
+          subjectLength: template.subject?.length || 0,
+          bodyLength: template.htmlContent?.length || 0,
+          hasCcEmails: !!template.ccEmails,
+          hasBccEmails: !!template.bccEmails
+        })}`, 'info', 'emails');
+
+        // Determine recipient based on rule configuration
+        let recipientEmail = '';
+        let recipientSource = '';
+
+        const recipientType = getRecipientType(rule);
+        const recipientFieldId = getRecipientField(rule);
+        const fixedRecipientEmail = getRecipientEmail(rule);
+
+        if (recipientType === 'FIXED' && fixedRecipientEmail) {
+          // Use fixed email from rule
+          recipientEmail = fixedRecipientEmail;
+          recipientSource = 'fixed';
+        } else if (recipientType === 'FIELD' && recipientFieldId) {
+          // Use email from form field
+          recipientEmail = mappedData[recipientFieldId] || '';
+          recipientSource = `field:${recipientFieldId}`;
+        } else if (mappedData.email) {
+          // Fallback to email field if available
+          recipientEmail = mappedData.email;
+          recipientSource = 'email field';
+        }
+
+        // Validate recipient email
+        if (!recipientEmail || !isValidEmail(recipientEmail)) {
+          addApiLog(`No valid recipient email found for rule: ${rule.name}`, 'error', 'emails');
+          return {
+            ruleId: rule.id,
+            sent: false,
+            message: 'No valid recipient email found',
+            error: 'MISSING_RECIPIENT'
+          };
+        }
+        
+        // Add additional logging for sending preparation
+        addApiLog(`Preparing to send email to: ${recipientEmail} (source: ${recipientSource})`, 'info', 'emails');
+
+        // Get template ID safely
+        const templateId = getTemplateId(rule);
+        if (!templateId) {
+          throw new Error('Missing template ID');
+        }
+        
+        // Get CC and BCC emails
+        // Convert null to undefined for TypeScript compatibility
+        const ccEmails = getCcEmails(rule) === null ? undefined : getCcEmails(rule);
+        const bccEmails = getBccEmails(rule) === null ? undefined : getBccEmails(rule);
+
+        // Process the email directly through processEmailAsync
+        try {
+          
+          // Log CC/BCC details for debugging
+          addApiLog(`CC emails: ${ccEmails || 'none'}, BCC emails: ${bccEmails || 'none'}`, 'info', 'emails');
+          
+          const result = await processEmailAsync({
+            templateId,
+            submissionId: submission.id,
+            leadId: submission.leadId || undefined,
+            data: formDataWithMappings,
+            userId: rule.userId || template.userId || '',
+            recipient: recipientEmail,
+            ccEmails: ccEmails || undefined,
+            bccEmails: bccEmails || undefined,
+            ruleId: rule.id
+          });
+          
+          // Log successful email processing
+          addApiLog(`Email processed successfully for recipient: ${recipientEmail}`, 'success', 'emails');
+          
+          // Return success
+          return {
+            ruleId: rule.id,
+            sent: true,
+            message: 'Email processed successfully',
+            async: false
+          };
+        } catch (errorObj) {
+          // Cast the unknown error to a standard format
+          const error = errorObj as any;
+          const errorMessage = error?.message || 'Unknown error';
+          addApiLog(`Error processing email: ${errorMessage}`, 'error', 'emails');
+          
+          // Record the failed email in the database
+          try {
+            const emailRecord = await prisma.emailLog.create({
+              data: {
+                templateId: getTemplateId(rule) || '',
+                recipient: recipientEmail,
+                subject: template.subject || '',
+                status: 'FAILED',
+                userId: rule.userId,
+                formSubmissionId: submission.id,
+                error: errorMessage,
+                ccRecipients: ccEmails || undefined,
+                bccRecipients: bccEmails || undefined
+              },
+            });
+            
+            addApiLog(`Failed email record created with ID: ${emailRecord.id}`, 'info', 'emails');
+          } catch (recordErrorObj) {
+            // Cast the unknown error to a standard format
+            const recordError = recordErrorObj as any;
+            const recordErrorMessage = recordError?.message || 'Unknown error';
+            addApiLog(`Error creating email record: ${recordErrorMessage}`, 'error', 'emails');
+          }
+
+          return {
+            ruleId: rule.id,
+            sent: false,
+            message: `Error processing email: ${errorMessage}`,
+          };
+        }
+      })
+    );
+
+    addApiLog(`Email processing completed with results: ${JSON.stringify(results)}`, 'success', 'emails');
+    
+    return res.status(200).json({
+      submissionId: submission.id,
+      results,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    addApiLog(`Error processing email rules: ${errorMessage}`, 'error', 'emails');
+    console.error('Error processing email rules:', error);
+    return res.status(500).json({ error: errorMessage });
+  }
+}

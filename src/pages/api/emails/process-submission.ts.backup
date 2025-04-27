@@ -1,0 +1,86 @@
+/**
+ * DEPRECATED: Legacy Email Processing API (Forms 1.0)
+ * 
+ * This file is deprecated and will be removed in a future version.
+ * Please use the Email System 2.0 API instead:
+ * - src/pages/api/emails2/process-submission.ts
+ */
+
+import { NextApiRequest, NextApiResponse } from 'next';
+import * as logger from '@/util/logger';
+import { PrismaClient } from '@prisma/client';
+import path from 'path';
+import { EmailProcessor } from '@/lib/emails2/emailProcessor';
+
+// Initialize the Email System 2.0 processor
+const emailProcessor = new EmailProcessor();
+
+// Standard logging header for file
+const fileName = path.basename(__filename);
+const fileVersion = '1.0 (DEPRECATED)';
+console.log(`[FILE NAME] ${fileName}`);
+console.log(`[${fileVersion} FILE]`);
+console.log(`[DEPRECATED] This file is deprecated and will be removed in a future version.`);
+console.log(`[DEPRECATED] Please use the Email System 2.0 API instead.`);
+
+// Log deprecation warning
+logger.warn('[DEPRECATED] The legacy email processing API at /api/emails/process-submission is deprecated. Use the Email System 2.0 API instead.', 'forms');
+
+/**
+ * DEPRECATED: API handler for email processing
+ * This API is deprecated and will be removed in a future version.
+ * Please use the Email System 2.0 API instead.
+ */
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // Log deprecation warning on each call
+  logger.warn('[DEPRECATED] Using legacy email processing API. This will be removed in a future version.', 'forms');
+  console.log(`[DEPRECATED] Using legacy email processing API. Please migrate to Email System 2.0.`);
+  
+  try {
+    // Only allow POST method
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed' });
+    }
+
+    const { formId, submissionId, data, source = 'api' } = req.body;
+
+    if (!formId) {
+      return res.status(400).json({ error: 'Form ID is required' });
+    }
+
+    logger.info(`[COMPATIBILITY LAYER] Redirecting to Email System 2.0 for form: ${formId}`, 'emails');
+    console.log(`[COMPATIBILITY LAYER] Redirecting to Email System 2.0 for form: ${formId}`);
+    
+    // Use the Email System 2.0 processor directly
+    const result = await emailProcessor.processSubmission({
+      formId,
+      submissionId,
+      data: data || {},
+      source,
+    });
+    
+    // Return the result from the Email System 2.0
+    return res.status(200).json({
+      success: result.success,
+      processedRules: result.processedRules,
+      queuedEmails: result.queuedEmails,
+      correlationId: result.correlationId,
+      logs: result.logs,
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    logger.error(`[COMPATIBILITY LAYER] Error redirecting to Email System 2.0: ${errorMessage}`, 'emails');
+    console.error(`[ERROR] Error processing submission:`, error);
+    
+    return res.status(500).json({ 
+      success: false, 
+      error: errorMessage,
+      correlationId: req.body.correlationId,
+      logs: [{
+        type: 'error',
+        message: errorMessage,
+        timestamp: new Date().toISOString()
+      }]
+    });
+  }
+}

@@ -1,0 +1,2832 @@
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\pages\api\leads\index.ts (leads index)
+
+import { NextApiRequest, NextApiResponse } from 'next';
+import prisma from '@/lib/prisma';
+import axios from 'axios';
+import { createClient } from '@/util/supabase/api';
+import { addApiLog } from '../debug/logs';
+
+interface FormField {
+  id: string;
+  type: string;
+  name: string;
+  label?: string;
+  mapping?: string;
+}
+
+interface Lead {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  form?: {
+    id: string;
+    name: string;
+    fields: any[];
+  } | null;
+  submissions: Array<{
+    id: string;
+    data: any;
+  }>;
+  createdAt: Date;
+  leadId?: string;
+}
+
+interface TransformedLead {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  form: {
+    id: string | undefined;
+    name: string;
+  };
+  createdAt: Date;
+  mappedData: Record<string, any>;
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // Set cache control headers to prevent caching
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  
+  // Handle different HTTP methods
+  switch (req.method) {
+    case 'GET':
+      return getLeads(req, res);
+    case 'POST':
+      return createLead(req, res);
+    default:
+      return res.status(405).json({ error: 'Method not allowed' });
+  }
+}
+
+async function getLeads(req: NextApiRequest, res: NextApiResponse) {
+  // Create a timeout promise to prevent hanging requests
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error('Database query timeout'));
+    }, 10000); // 10 second timeout
+  });
+
+  try {
+    addApiLog('Starting leads fetch', 'info', 'leads');
+    
+    // Get the authenticated user
+    const supabase = createClient(req, res);
+    const authPromise = supabase.auth.getUser();
+    const authResult = await Promise.race([authPromise, timeoutPromise]) as any;
+    const { data: { user }, error: authError } = authResult;
+
+    if (authError || !user) {
+      addApiLog('Auth error or no user', 'error', 'leads');
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    addApiLog('Authenticated user', 'success', 'leads');
+
+    // Create the database query promise with a limit to prevent large result sets
+    const queryPromise = prisma.lead.findMany({
+      // Temporarily remove user filtering to see all leads
+      // where: {
+      //   assignedUserId: user.id
+      // },
+      orderBy: {
+        createdAt: 'desc',
+      },
+      take: 100, // Limit to 100 records to prevent timeouts
+      include: {
+        form: {
+          select: {
+            id: true,
+            name: true,
+            fields: true,
+          },
+        },
+        submissions: {
+          select: {
+            id: true,
+            data: true,
+          },
+          take: 1, // Only get the most recent submission
+        },
+      },
+    });
+
+    // Race the database query against the timeout
+    const leads = await Promise.race([queryPromise, timeoutPromise]) as Lead[];
+
+    addApiLog(`Retrieved ${leads.length} leads`, 'success', 'leads');
+
+    // Transform the leads data to include mapped field names
+    // Process leads in smaller batches to avoid timeouts with large datasets
+    const BATCH_SIZE = 10;
+    let transformedLeads: TransformedLead[] = [];
+    
+    for (let i = 0; i < leads.length; i += BATCH_SIZE) {
+      const batch = leads.slice(i, i + BATCH_SIZE);
+      addApiLog(`Processing batch ${i / BATCH_SIZE + 1} of ${Math.ceil(leads.length / BATCH_SIZE)}`, 'info', 'leads');
+      
+      const batchResults = batch.map((lead: Lead) => {
+        try {
+          const submission = lead.submissions[0]?.data as Record<string, any> || {};
+          // Ensure lead.form?.fields is an array before calling map
+          const formFields = Array.isArray(lead.form?.fields) ? lead.form.fields : [];
+          const fields: FormField[] = formFields.map(field => ({
+            id: field.id || '',
+            type: field.type || '',
+            name: field.name || '',
+            label: field.label || '',
+            mapping: field.mapping || ''
+          }));
+
+          // Simplified field extraction
+          const getName = () => {
+            try {
+              // First check for direct name field
+              if (lead.name) return lead.name;
+
+              // Look for fields with 'name' in the label
+              const nameField = fields.find(f => 
+                (f.label || '').toLowerCase().includes('name') ||
+                (f.name || '').toLowerCase().includes('name')
+              );
+
+              if (nameField && submission[nameField.id]) {
+                return String(submission[nameField.id]);
+              }
+
+              return null;
+            } catch (error) {
+              addApiLog(`Error in getName for lead ${lead.id}: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'leads');
+              return lead.name || null;
+            }
+          };
+
+          const getEmail = () => {
+            try {
+              // First check for direct email
+              if (lead.email) return lead.email;
+
+              // Look for fields with 'email' in the label
+              const emailField = fields.find(f => 
+                (f.label || '').toLowerCase().includes('email') ||
+                (f.name || '').toLowerCase().includes('email')
+              );
+
+              return emailField && submission[emailField.id] 
+                ? String(submission[emailField.id])
+                : null;
+            } catch (error) {
+              addApiLog(`Error in getEmail for lead ${lead.id}: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'leads');
+              return lead.email || null;
+            }
+          };
+
+          const getPhone = () => {
+            try {
+              // First check for direct phone
+              if (lead.phone) return lead.phone;
+
+              // Look for fields with 'phone' or 'mobile' in the label
+              // but exclude DOB fields to prevent incorrect mapping
+              const phoneField = fields.find(f => {
+                const labelLower = (f.label || '').toLowerCase();
+                const nameLower = (f.name || '').toLowerCase();
+                const typeLower = (f.type || '').toLowerCase();
+                
+                // Check if it's a phone field
+                const isPhoneField = 
+                  labelLower.includes('phone') ||
+                  labelLower.includes('mobile') ||
+                  nameLower.includes('phone') ||
+                  nameLower.includes('mobile');
+                
+                // Make sure it's not a DOB field
+                const isDOBField = 
+                  typeLower === 'dob' ||
+                  labelLower.includes('birth') ||
+                  labelLower.includes('dob') ||
+                  nameLower.includes('birth') ||
+                  nameLower.includes('dob');
+                
+                return isPhoneField && !isDOBField;
+              });
+
+              return phoneField && submission[phoneField.id]
+                ? String(submission[phoneField.id])
+                : null;
+            } catch (error) {
+              addApiLog(`Error in getPhone for lead ${lead.id}: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'leads');
+              return lead.phone || null;
+            }
+          };
+
+          // Simplified mapped data extraction
+          const mappedData: Record<string, any> = {};
+          try {
+            // Only include essential fields to reduce payload size
+            for (const field of fields) {
+              const value = submission[field.id];
+              if (value !== undefined && value !== null) {
+                const fieldName = field.label || field.name;
+                const isEssentialField = 
+                  fieldName.toLowerCase().includes('name') || 
+                  fieldName.toLowerCase().includes('email') || 
+                  fieldName.toLowerCase().includes('phone') || 
+                  fieldName.toLowerCase().includes('mobile');
+                  
+                if (isEssentialField) {
+                  // Use bracket notation to safely add to the record
+                  mappedData[fieldName] = value;
+                }
+              }
+            }
+          } catch (error) {
+            addApiLog(`Error mapping data for lead ${lead.id}: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'leads');
+          }
+
+          const result = {
+            id: lead.id,
+            name: getName(),
+            email: getEmail(),
+            phone: getPhone(),
+            form: {
+              id: lead.form?.id,
+              name: lead.form?.name || 'Unknown Form'
+            },
+            createdAt: lead.createdAt,
+            mappedData
+          };
+
+          return result;
+        } catch (error) {
+          addApiLog(`Error processing lead ${lead.id}: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'leads');
+          // Return a safe fallback object for this lead
+          return {
+            id: lead.id,
+            name: lead.name || null,
+            email: lead.email || null,
+            phone: lead.phone || null,
+            form: {
+              id: lead.form?.id,
+              name: lead.form?.name || 'Unknown Form'
+            },
+            createdAt: lead.createdAt,
+            mappedData: {}
+          };
+        }
+      });
+      
+      // Filter out any null or undefined results before merging
+      transformedLeads = [...transformedLeads, ...batchResults.filter(Boolean)];
+      
+      // Add a small delay between batches to prevent CPU overload
+      if (i + BATCH_SIZE < leads.length) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    }
+
+    addApiLog(`Final transformed leads count: ${transformedLeads.length}`, 'success', 'leads');
+    return res.status(200).json(transformedLeads);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    addApiLog(`Error fetching leads: ${errorMessage}`, 'error', 'leads');
+    
+    if (errorMessage === 'Database query timeout') {
+      return res.status(504).json({ 
+        error: 'Request timed out while fetching leads',
+        message: 'The server took too long to respond. Please try again later.'
+      });
+    }
+    
+    return res.status(500).json({ 
+      error: 'Failed to fetch leads',
+      message: errorMessage
+    });
+  }
+}
+
+const createLead = async (req: NextApiRequest, res: NextApiResponse): Promise<void> => {
+  console.log(`[LEAD API] Starting lead creation process`);
+  addApiLog(`Starting lead creation process`, 'info', 'leads');
+  // Create a timeout promise to prevent hanging requests
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    setTimeout(() => {
+      reject(new Error('Database operation timeout'));
+    }, 8000); // 8 second timeout
+  });
+
+  try {
+    let { formId, name, email, phone, mappedData } = req.body;
+    
+    console.log(`[LEAD API] Initial request data:`, {
+      formId,
+      name,
+      email,
+      phone,
+      hasMappedData: !!mappedData,
+      mappedDataKeys: mappedData ? Object.keys(mappedData) : []
+    });
+    addApiLog(`Initial request data: formId=${formId}, name=${name}, email=${email}, phone=${phone}`, 'info', 'leads');
+
+    // Check if we have the new __mappedFields structure in the mappedData
+    if (mappedData && mappedData.__mappedFields) {
+      console.log(`[LEAD API] Found __mappedFields in mappedData:`, mappedData.__mappedFields);
+      const mappedFields = mappedData.__mappedFields;
+      addApiLog(`Found __mappedFields in submission data: ${JSON.stringify(mappedFields)}`, 'info', 'leads');
+      
+      // Extract first name and last name from mapped fields if available
+      let firstName = '';
+      let lastName = '';
+      let rawNameField = '';
+      
+      // Store the raw name field, but don't use it yet - we'll prioritize firstName + lastName
+      if (mappedFields.name && mappedFields.name.value) {
+        rawNameField = mappedFields.name.value;
+        addApiLog(`Found raw name field in __mappedFields: ${rawNameField}`, 'info', 'leads');
+      }
+      
+      // Check for firstName in mappedFields
+      if (mappedFields.firstName && mappedFields.firstName.value) {
+        firstName = mappedFields.firstName.value;
+        addApiLog(`Found firstName in __mappedFields: ${firstName}`, 'info', 'leads');
+      }
+      
+      // Check for lastName in mappedFields
+      if (mappedFields.lastName && mappedFields.lastName.value) {
+        lastName = mappedFields.lastName.value;
+        addApiLog(`Found lastName in __mappedFields: ${lastName}`, 'info', 'leads');
+      }
+      
+      // ALWAYS prioritize firstName + lastName combination if available
+      if (firstName && lastName) {
+        const originalName = name;
+        name = `${firstName} ${lastName}`;
+        console.log(`[LEAD API] Prioritizing firstName + lastName: Changed name from "${originalName}" to "${name}"`);
+        addApiLog(`Using combined firstName and lastName for name: ${name}`, 'info', 'leads');
+      } else if (firstName) {
+        name = firstName;
+        addApiLog(`Using firstName as name: ${name}`, 'info', 'leads');
+      } else if (lastName) {
+        name = lastName;
+        addApiLog(`Using lastName as name: ${name}`, 'info', 'leads');
+      } else if (rawNameField) {
+        // Only fall back to the raw name field if we don't have firstName or lastName
+        name = rawNameField;
+        addApiLog(`Falling back to raw name field: ${name}`, 'info', 'leads');
+      }
+      
+      // If we still don't have a name, check for any field with 'name' in its label
+      if (!name) {
+        for (const key in mappedFields) {
+          const field = mappedFields[key];
+          if (field.label && field.label.toLowerCase().includes('name') && field.value) {
+            name = field.value;
+            addApiLog(`Using field with name in label: ${field.label} = ${name}`, 'info', 'leads');
+            break;
+          }
+        }
+      }
+      
+      // Get email and phone from mapped fields if not provided directly
+      if (!email && mappedFields.email && mappedFields.email.value) {
+        email = mappedFields.email.value;
+        addApiLog(`Found email in __mappedFields: ${email}`, 'info', 'leads');
+      }
+      
+      if (!phone && mappedFields.phone && mappedFields.phone.value) {
+        phone = mappedFields.phone.value;
+        addApiLog(`Found phone in __mappedFields: ${phone}`, 'info', 'leads');
+      }
+    }
+    
+    // Check if we have name directly in mappedData (this might be set by the cleanSubmissionData method)
+    if (!name && mappedData.name) {
+      name = mappedData.name;
+      addApiLog(`Using name directly from mappedData: ${name}`, 'info', 'leads');
+    }
+    
+    // Final check for first name and last name directly in mappedData
+    if (!name && (mappedData.firstName || mappedData.lastName)) {
+      const firstName = mappedData.firstName || '';
+      const lastName = mappedData.lastName || '';
+      
+      if (firstName && lastName) {
+        name = `${firstName} ${lastName}`;
+        addApiLog(`Combined name from firstName and lastName in mappedData: ${name}`, 'info', 'leads');
+      } else if (firstName) {
+        name = firstName;
+        addApiLog(`Using firstName from mappedData as name: ${name}`, 'info', 'leads');
+      } else if (lastName) {
+        name = lastName;
+        addApiLog(`Using lastName from mappedData as name: ${name}`, 'info', 'leads');
+      }
+    }
+
+    // Validate required fields
+    if (!formId || !name || !email) {
+      addApiLog('Missing required fields for lead', 'error', 'leads');
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    addApiLog(`Creating lead with name: ${name}, email: ${email}, phone: ${phone}`, 'info', 'leads');
+    
+    // Log the name that will be used for the lead
+    addApiLog(`Creating lead with name: "${name}" (original from form data)`, 'info', 'leads');
+    
+    // Double-check if we have firstName and lastName in mappedData but name wasn't properly combined
+    if (mappedData && mappedData.__mappedFields) {
+      const mappedFields = mappedData.__mappedFields;
+      const firstName = mappedFields.firstName?.value || '';
+      const lastName = mappedFields.lastName?.value || '';
+      
+      // If we have both first and last name, make sure the name field is properly combined
+      if (firstName && lastName && name !== `${firstName} ${lastName}`) {
+        const fullName = `${firstName} ${lastName}`;
+        addApiLog(`Updating name from "${name}" to "${fullName}" based on firstName and lastName fields`, 'info', 'leads');
+        name = fullName;
+      }
+    }
+    
+    // Create the lead with timeout protection
+    const createLeadPromise = prisma.lead.create({
+      data: {
+        formId,
+        name,
+        email,
+        phone,
+        status: 'NEW'
+      },
+      include: {
+        form: true,
+        submissions: true
+      }
+    });
+    
+    console.log(`[LEAD API] Creating lead with data:`, {
+      name,
+      email,
+      phone,
+      status: 'NEW',
+      source: 'FORM',
+      formId
+    });
+    
+    const lead = await Promise.race([createLeadPromise, timeoutPromise]) as any;
+    
+    addApiLog(`Lead created with ID: ${lead.id}`, 'success', 'leads');
+    
+    // If we have mapped data, create a form submission
+    if (mappedData && Object.keys(mappedData).length > 0) {
+      addApiLog(`Creating form submission for lead ID: ${lead.id}`, 'info', 'leads');
+      
+      // Extract tracking token and source lead ID if present
+      const trackingToken = mappedData._trackingToken || null;
+      const sourceLeadId = mappedData._sourceLeadId || null;
+      const timeStamp = new Date().getTime().toString();
+      
+      console.log('DEBUG - Form submission tracking data:', {
+        trackingToken,
+        sourceLeadId,
+        timeStamp
+      });
+      
+      addApiLog(`Form submission tracking data: ${JSON.stringify({
+        trackingToken,
+        sourceLeadId,
+        timeStamp
+      })}`, 'info', 'leads');
+      
+      try {
+        // Create submission with timeout protection and tracking data
+        const createSubmissionPromise = prisma.formSubmission.create({
+          data: {
+            formId,
+            leadId: lead.id,
+            data: mappedData,
+            trackingToken,
+            sourceLeadId,
+            timeStamp
+          }
+        });
+        
+        const submission = await Promise.race([createSubmissionPromise, timeoutPromise]) as any;
+        
+        addApiLog(`Form submission created with ID: ${submission.id}`, 'success', 'leads');
+        
+        // Process email rules for this submission - but don't wait for it to complete
+        // This prevents timeouts when creating leads
+        try {
+          addApiLog(`Scheduling email rules processing for submission: ${submission.id}`, 'info', 'leads');
+          
+          // Log what we're doing
+          addApiLog(`Will process email rules with data: ${JSON.stringify({
+            formId,
+            submissionId: submission.id,
+            formDataKeys: Object.keys(mappedData)
+          })}`, 'info', 'leads');
+          
+          // Instead of waiting for the email processing to complete,
+          // we'll process it asynchronously and not block the response
+          
+          // Force localhost in development mode, regardless of .env settings
+          const baseUrl = process.env.NODE_ENV === 'development' 
+            ? `http://localhost:${process.env.PORT || 3000}`
+            : process.env.NEXT_PUBLIC_BASE_URL;
+          
+          // Process email rules asynchronously without waiting for the response
+          // This prevents timeouts when creating leads
+          setTimeout(async () => {
+            try {
+              addApiLog(`Executing delayed email processing for submission: ${submission.id}`, 'info', 'leads');
+              
+              const emailResponse = await axios.post(
+                `${baseUrl}/api/emails/process-submission2`,
+                {
+                  formId,
+                  formData: mappedData,
+                  submissionId: submission.id
+                },
+                {
+                  headers: {
+                    'Content-Type': 'application/json'
+                  },
+                  // Increase timeout to prevent timeout errors with complex email processing
+                  timeout: 30000
+                }
+              );
+              
+              addApiLog(`Email processing response status: ${emailResponse.status}`, 'success', 'leads');
+              addApiLog(`Email processing result: ${JSON.stringify(emailResponse.data)}`, 'success', 'leads');
+            } catch (emailError) {
+              addApiLog(`Error in delayed email processing: ${emailError instanceof Error ? emailError.message : 'Unknown error'}`, 'error', 'leads');
+              
+              // Check if the error has a response (axios error)
+              const axiosError = emailError as any;
+              if (axiosError.response) {
+                addApiLog(`Email API response error: ${JSON.stringify({
+                  status: axiosError.response.status,
+                  data: axiosError.response.data
+                })}`, 'error', 'leads');
+              } else if (axiosError.request) {
+                addApiLog('Email API request made but no response received', 'error', 'leads');
+              } else {
+                const errorMessage = axiosError.message || 'Unknown error';
+                addApiLog(`Email API request setup error: ${errorMessage}`, 'error', 'leads');
+              }
+            }
+          }, 100); // Small delay to ensure the response is sent first
+          
+        } catch (emailError) {
+          addApiLog(`Error scheduling email rules processing: ${emailError instanceof Error ? emailError.message : 'Unknown error'}`, 'error', 'leads');
+        }
+        
+        // Fetch the updated lead with the new submission, with timeout protection
+        const fetchUpdatedLeadPromise = prisma.lead.findUnique({
+          where: { id: lead.id },
+          include: {
+            form: true,
+            submissions: true
+          }
+        });
+        
+        const updatedLead = await Promise.race([fetchUpdatedLeadPromise, timeoutPromise]) as any;
+        
+        addApiLog(`Successfully created lead with submission: ${lead.id}`, 'success', 'leads');
+        return res.status(201).json({
+          ...updatedLead,
+          submissionId: submission.id
+        });
+      } catch (submissionError) {
+        // Check if it's a timeout error
+        if (submissionError instanceof Error && submissionError.message === 'Database operation timeout') {
+          addApiLog(`Submission creation timed out for lead: ${lead.id}`, 'error', 'leads');
+          // Continue with the lead we already created
+        } else {
+          addApiLog(`Error creating submission: ${submissionError instanceof Error ? submissionError.message : 'Unknown error'}`, 'error', 'leads');
+        }
+        // Continue even if submission creation fails
+        // We already have the lead created
+      }
+    }
+
+    addApiLog(`Successfully created lead: ${lead.id}`, 'success', 'leads');
+    console.log(`[LEAD API] Lead created successfully with ID: ${lead.id} and name: "${lead.name}"`);
+    addApiLog(`Lead created successfully with ID: ${lead.id} and name: ${lead.name}`, 'info', 'leads');
+    
+    return res.status(201).json(lead);
+  } catch (error) {
+    // Check if it's a timeout error
+    if (error instanceof Error && error.message === 'Database operation timeout') {
+      addApiLog('Lead creation timed out', 'error', 'leads');
+      return res.status(504).json({ 
+        error: 'Request timed out while creating lead',
+        message: 'The server took too long to respond. Please try again later.'
+      });
+    }
+    
+    addApiLog(`Error creating lead: ${error instanceof Error ? error.message : 'Unknown error'}`, 'error', 'leads');
+    return res.status(500).json({ error: 'Failed to create lead: ' + (error as Error).message });
+  }
+}
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\pages\api\forms2\public\[id]\submit2.ts
+
+/**
+ * Form System 2.0 API - Public Form Submission Endpoint
+ * 
+ * POST: Submit form data for a public form
+ * This endpoint does not require authentication and is used for public form submissions
+ * 
+ * Refactored to use modular services for better maintainability
+ */
+
+import { NextApiRequest, NextApiResponse } from 'next';
+import * as logger from '@/util/logger';
+import { FormRepository } from '@/lib/forms2/repositories/formRepository';
+import { submissionService as submissionService2, handleApiError as handleApiError2 } from '@/lib/forms2/services/submission';
+import { prisma } from '@/lib/prisma';
+
+const formRepository2 = new FormRepository();
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  console.log(`[FORM SUBMIT API] Starting form submission handler`);
+  const { id } = req.query;
+
+  if (!id || typeof id !== 'string') {
+    return res.status(400).json({ error: 'Form ID is required' });
+  }
+
+  try {
+    // Only allow POST method for submissions
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method not allowed' });
+    }
+
+    logger.info(`Public form submission for form ID: ${id}`, 'forms');
+    
+    // Check if form exists and is public
+    const form = await formRepository2.getFormById(id);
+    
+    if (!form) {
+      logger.warn(`Public form not found: ${id}`, 'forms');
+      return res.status(404).json({ error: 'Form not found' });
+    }
+    
+    // All forms are treated as public per requirement
+    const formFields = typeof form.fields === 'string' ? JSON.parse(form.fields) : form.fields;
+    
+    // Log for debugging but don't block submission
+    if (formFields?.isPublic !== true) {
+      logger.info(`Note: Form ${id} doesn't have isPublic flag set but allowing submission anyway`, 'forms');
+    }
+    
+    // Check if the form is active
+    if (!form.isActive) {
+      logger.warn(`Attempted to submit to inactive form: ${id}`, 'forms');
+      return res.status(403).json({ error: 'This form is currently inactive' });
+    }
+
+    const { formData } = req.body;
+    
+    console.log(`[FORM SUBMIT API] Received form data:`, {
+      formId: id,
+      hasFormData: !!formData,
+      formDataKeys: formData ? Object.keys(formData) : []
+    });
+    
+    if (!formData) {
+      logger.error('Form data is missing in submission', 'forms');
+      return res.status(400).json({ error: 'Form data is required' });
+    }
+    
+    // Generate timestamp in the correct format (milliseconds since epoch as string)
+    const timestamp = new Date().getTime();
+    const timestampStr = timestamp.toString();
+    
+    // Generate tracking token if not provided
+    const trackingToken = req.headers['x-tracking-token'] ? 
+      String(req.headers['x-tracking-token']) : 
+      `form-${id}-${timestampStr}`;
+
+    // Process the submission using our service
+    // Explicitly set the source as 'forms2-api' to ensure proper email processing
+    console.log(`[FORM SUBMIT API] Processing submission with:`, {
+      formId: id,
+      trackingToken,
+      timestamp: timestampStr,
+      source: 'forms2-api'
+    });
+    
+    const result = await submissionService2.processSubmission(
+      id,
+      formData,
+      trackingToken,
+      timestampStr,
+      'forms2-api', // Explicitly mark this as coming from the forms2 API
+      false // Skip synchronous email processing to avoid timeout
+    );
+    
+    console.log(`[FORM SUBMIT API] Submission processing result:`, {
+      success: result.success,
+      message: result.message,
+      submissionId: result.submissionId,
+      leadId: result.leadId,
+      bookingId: result.bookingId
+    });
+    
+    // Queue email for asynchronous processing
+    if (result.submissionId) {
+      try {
+        // Find a valid recipient email from the form data
+        let recipientEmail = 'system';
+        
+        // Try to extract email from form data
+        if (formData && formData.email && typeof formData.email === 'string' && formData.email.includes('@')) {
+          recipientEmail = formData.email;
+          logger.info(`Using email from form data: ${recipientEmail}`, 'forms');
+        }
+        
+        // If we have a lead ID from the result, try to get the email from there
+        if (result.leadId && recipientEmail === 'system') {
+          try {
+            const lead = await prisma.lead.findUnique({
+              where: { id: result.leadId },
+              select: { email: true }
+            });
+            
+            if (lead?.email && lead.email.includes('@')) {
+              recipientEmail = lead.email;
+              logger.info(`Using email from lead: ${recipientEmail}`, 'forms');
+            }
+          } catch (error) {
+            logger.error(`Error fetching lead email: ${error}`, 'forms');
+          }
+        }
+        
+        // Add to email processing queue
+        await prisma.emailQueue2.create({
+          data: {
+            submissionId: result.submissionId,
+            formId: id,
+            source: 'forms2-api',
+            status: 'pending',
+            correlationId: result.submissionId, // Use submissionId as correlation ID
+            templateId: 'system', // Use a placeholder or appropriate value
+            recipient: recipientEmail, // Use the email we found, or 'system' as fallback
+            subject: 'Form Submission', // Placeholder
+            html: '', // Will be generated by the email processor
+          }
+        });
+        
+        logger.info(`Queued email processing for submission: ${result.submissionId}`, 'forms');
+      } catch (queueError) {
+        // Don't fail the submission if queuing fails
+        logger.error(`Error queuing email for processing: ${queueError}`, 'forms');
+      }
+    }
+
+    // Return success response
+    console.log(`[FORM SUBMIT API] Returning success response with IDs:`, {
+      submissionId: result.submissionId,
+      leadId: result.leadId,
+      bookingId: result.bookingId
+    });
+    
+    return res.status(200).json({
+      success: true,
+      message: result.message || 'Form submitted successfully',
+      data: {
+        submissionId: result.submissionId,
+        leadId: result.leadId,
+        bookingId: result.bookingId
+      }
+    });
+  } catch (error) {
+    // Handle the error using our error handling service
+    handleApiError2(res, error);
+  }
+}
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\services\submission\leadService.ts
+
+import { prisma } from '../../../../lib/prisma';
+import * as logger from '@/util/logger';
+import { extractContactInfo } from '@/lib/forms2/services/mapping';
+
+// Helper function for detailed logging
+const logLeadData = (prefix: string, data: any) => {
+  console.log(`[LEAD SERVICE] ${prefix}:`, JSON.stringify(data, null, 2));
+  logger.info(`${prefix}: ${JSON.stringify(data)}`, 'leads');
+};
+
+/**
+ * Creates a lead from the mapped form data
+ * @param formId The form ID
+ * @param mappedData The mapped form data
+ * @param formData The raw form data (used as fallback)
+ * @returns The created lead ID
+ */
+export const createLeadFromFormData = async (
+  formId: string,
+  mappedData: Record<string, any>,
+  formData: Record<string, any>
+): Promise<string> => {
+  console.log(`[LEAD SERVICE] Creating lead for inquiry form: ${formId}`);
+  logger.info(`Creating lead for inquiry form: ${formId}`, 'forms');
+  
+  // Log the complete mapped data for debugging
+  logLeadData('Complete mapped data', mappedData);
+  
+  // Check if we have firstName and lastName in the mapped data
+  if (mappedData.firstName || mappedData.lastName) {
+    console.log(`[LEAD SERVICE] Found name components: firstName=${mappedData.firstName}, lastName=${mappedData.lastName}`);
+  }
+  
+  // Check if we have __mappedFields in the mapped data
+  if (mappedData.__mappedFields) {
+    console.log(`[LEAD SERVICE] Found __mappedFields:`, mappedData.__mappedFields);
+  }
+  
+  // Extract email, name, and phone from the mapped data
+  let email = mappedData.email || null;
+  let name = mappedData.name || null;
+  let phone = mappedData.phone || null;
+  
+  // Look for firstName and lastName in both mappedData and raw formData
+  let firstName = mappedData.firstName || null;
+  let lastName = mappedData.lastName || null;
+  
+  // Check raw form data for first_name and last_name fields if not found in mappedData
+  if (!firstName && formData.first_name) {
+    firstName = formData.first_name;
+    console.log(`[LEAD SERVICE] Found firstName in raw form data: "${firstName}"`);
+  }
+  
+  if (!lastName && formData.last_name) {
+    lastName = formData.last_name;
+    console.log(`[LEAD SERVICE] Found lastName in raw form data: "${lastName}"`);
+  }
+  
+  // Also check for fields with specific field IDs that might contain first name and last name
+  for (const [key, value] of Object.entries(formData)) {
+    if (!value || typeof value !== 'string') continue;
+    
+    // Check for field labels that might indicate first name or last name
+    if (!firstName) {
+      if (key.includes('first') || key.toLowerCase().includes('firstname')) {
+        firstName = value;
+        console.log(`[LEAD SERVICE] Found firstName in field ${key}: "${firstName}"`);
+      }
+    }
+    
+    if (!lastName) {
+      if (key.includes('last') || key.toLowerCase().includes('lastname')) {
+        lastName = value;
+        console.log(`[LEAD SERVICE] Found lastName in field ${key}: "${lastName}"`);
+      }
+    }
+  }
+  
+  // Check if the phone field looks like a date
+  if (phone && typeof phone === 'string') {
+    const isLikelyDate = /^\d{4}-\d{1,2}-\d{1,2}/.test(phone) || // ISO date format
+                        /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(phone) || // MM/DD/YYYY
+                        /^\d{4}$/.test(phone); // Just a year
+    
+    if (isLikelyDate) {
+      console.log(`[LEAD SERVICE] Phone field appears to be a date: "${phone}". Looking for actual phone field.`);
+      phone = null; // Reset the phone field so we can look for a better match
+      
+      // Search for a better phone field in the raw form data
+      for (const [key, value] of Object.entries(formData)) {
+        if (!value || typeof value !== 'string') continue;
+        
+        const lowerKey = key.toLowerCase();
+        
+        // Look for keys that are likely to contain phone numbers
+        if (lowerKey.includes('phone') || lowerKey.includes('tel') || lowerKey.includes('mobile')) {
+          // Check if it looks like a phone number
+          const isLikelyPhone = /^[\d\s\+\-\(\)]{7,}$/.test(value) && 
+                               !/^\d{4}-\d{1,2}-\d{1,2}/.test(value) && // Not ISO date
+                               !/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(value); // Not MM/DD/YYYY
+          
+          if (isLikelyPhone) {
+            phone = value;
+            console.log(`[LEAD SERVICE] Found better phone field in ${key}: "${phone}"`);
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  // Also check for fields that might contain first name and last name
+  if (!firstName) {
+    // Look for fields with 'first' and 'name' in their key
+    for (const key of Object.keys(formData)) {
+      if ((key.includes('first') && key.includes('name')) || key === 'firstname') {
+        firstName = formData[key];
+        console.log(`[LEAD SERVICE] Found firstName in field ${key}: "${firstName}"`);
+        break;
+      }
+    }
+  }
+  
+  if (!lastName) {
+    // Look for fields with 'last' and 'name' in their key
+    for (const key of Object.keys(formData)) {
+      if ((key.includes('last') && key.includes('name')) || key === 'lastname') {
+        lastName = formData[key];
+        console.log(`[LEAD SERVICE] Found lastName in field ${key}: "${lastName}"`);
+        break;
+      }
+    }
+  }
+  
+  // Always prioritize firstName + lastName combination over name
+  if (firstName && lastName) {
+    name = `${firstName} ${lastName}`;
+    console.log(`[LEAD SERVICE] Combined firstName and lastName into name: "${name}"`);
+  } else if (firstName) {
+    name = firstName;
+    console.log(`[LEAD SERVICE] Using firstName as name: "${name}"`);
+  } else if (lastName) {
+    name = lastName;
+    console.log(`[LEAD SERVICE] Using lastName as name: "${name}"`);
+  }
+  
+  // One more check - look for first and last name in the form data directly by field label
+  if ((!firstName || !lastName) && !name.includes(' ')) {
+    for (const [key, value] of Object.entries(formData)) {
+      if (!value || typeof value !== 'string') continue;
+      
+      // Look for fields with labels that might indicate first name or last name
+      const keyLower = key.toLowerCase();
+      if (keyLower.includes('first') && keyLower.includes('name') && !firstName) {
+        firstName = value;
+        console.log(`[LEAD SERVICE] Found firstName by label in field ${key}: "${firstName}"`);
+      } else if (keyLower.includes('last') && keyLower.includes('name') && !lastName) {
+        lastName = value;
+        console.log(`[LEAD SERVICE] Found lastName by label in field ${key}: "${lastName}"`);
+      }
+    }
+    
+    // If we found both first and last name, combine them
+    if (firstName && lastName && !name.includes(' ')) {
+      name = `${firstName} ${lastName}`;
+      console.log(`[LEAD SERVICE] Updated name with newly found first and last name: "${name}"`);
+    }
+  }
+  
+  // Log the values we're using for lead creation
+  console.log(`[LEAD SERVICE] Creating lead with: email=${email}, name="${name}", phone=${phone}`);
+  logger.info(`Creating lead with: email=${email}, name=${name}, phone=${phone}`, 'forms');
+  
+  // Fallback to raw form data if mapping didn't work
+  if (!email && !name && !phone) {
+    logger.info(`No mapped data found, attempting to extract directly from form data`, 'forms');
+    
+    // Try to find email, name, and phone in the raw form data
+    const extractedData = extractContactInfo(formData);
+    
+    // Use found values if available
+    if (extractedData.email || extractedData.name || extractedData.phone) {
+      email = extractedData.email;
+      name = extractedData.name;
+      phone = extractedData.phone;
+      
+      logger.info(`Using extracted values: email=${email}, name=${name}, phone=${phone}`, 'forms');
+    }
+  }
+  
+  // Final check - log the data we're about to use for creating the lead
+  console.log(`[LEAD SERVICE] FINAL DATA for lead creation:`, {
+    email,
+    name,
+    phone,
+    source: 'public_form',
+    formId
+  });
+  
+  // Create lead with mapped or extracted data
+  const lead = await prisma.lead.create({
+    data: {
+      email,
+      name,
+      phone,
+      source: 'public_form',
+      formId,
+      status: 'NEW',
+    },
+  });
+  
+  logger.info(`Lead created: ${lead.id}`, 'forms');
+  console.log(`[LEAD SERVICE] Lead created with ID: ${lead.id}, name: "${lead.name}"`);
+  logger.info(`Lead created with ID: ${lead.id}, name: ${lead.name}`, 'forms');
+  
+  return lead.id;
+};
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\services\mapping\mapper.ts
+
+/**
+ * Form Field Mapper
+ * 
+ * This file contains the core mapping logic for form fields.
+ */
+
+import * as logger from '@/util/logger';
+import { FieldConfig, FormConfig } from '@/lib/forms2/core/types';
+import { StandardMappedFields, MappingOptions } from './types';
+import { 
+  explicitMappingStrategy, 
+  fieldTypeStrategy, 
+  fieldLabelStrategy, 
+  fieldIdStrategy, 
+  valuePatternStrategy 
+} from './strategies';
+import { extractContactInfo } from './contactInfoExtractor';
+
+/**
+ * Maps form data to standardized field names based on field configuration
+ * 
+ * @param formConfig The form configuration with sections and fields
+ * @param formData The submitted form data
+ * @param options Mapping options
+ * @returns Mapped data with standardized field names
+ */
+export const mapFormFields = (
+  formConfig: FormConfig,
+  formData: Record<string, any>,
+  options: MappingOptions = {}
+): StandardMappedFields => {
+  // Initialize mapped data with common fields
+  const mappedData: StandardMappedFields = {
+    email: null,
+    name: null,
+    first_name: null,
+    last_name: null,
+    phone: null,
+    date: null,
+    time: null,
+    location: null,
+    location_office: null,
+    datetime: null,
+  };
+  
+  // Add a __mappedFields object to store more detailed information about mapped fields
+  mappedData.__mappedFields = {};
+  
+  // Track which fields have been successfully mapped
+  const mappedFields = new Set<string>();
+  
+  // Log the raw form data for debugging
+  if (options.logMappingProcess) {
+    logger.info(`Raw form data: ${JSON.stringify(formData)}`, 'forms');
+  }
+  
+  // Create a lookup table for fields by ID
+  const fieldsById: Record<string, FieldConfig> = {};
+  
+  // Populate the fields lookup table
+  if (formConfig.sections && Array.isArray(formConfig.sections)) {
+    for (const section of formConfig.sections) {
+      if (!section.fields || !Array.isArray(section.fields)) continue;
+      
+      for (const field of section.fields) {
+        fieldsById[field.id] = field;
+      }
+    }
+  }
+  
+  // Apply mapping strategies to each field
+  for (const section of formConfig.sections || []) {
+    for (const field of section.fields || []) {
+      // Skip if field has no ID or stableId
+      if (!field.id && !field.stableId) continue;
+      
+      // Get the field value from the form data
+      const fieldId = field.stableId || field.id;
+      const fieldValue = formData[fieldId];
+      
+      // Skip if field has no value
+      if (fieldValue === undefined || fieldValue === null || fieldValue === '') continue;
+      
+      console.log(`[MAPPING] Processing field: ${field.label || 'Unnamed'} (${fieldId}) with value: ${fieldValue}`);
+      
+      // Try each mapping strategy in order of precedence
+      let mappingType = null;
+      
+      // 1. Explicit JSON mapping (highest precedence)
+      const explicitResult = explicitMappingStrategy(field, fieldId, fieldValue);
+      if (explicitResult) {
+        mappingType = explicitResult.mappedKey;
+        if (options.logMappingProcess) {
+          logger.info(`Mapped field ${fieldId} using JSON mapping: ${mappingType}`, 'forms');
+        }
+        console.log(`[MAPPING] Mapped field ${fieldId} to ${mappingType} using explicit-json strategy`);
+        
+        // Store the mapping in the __mappedFields object
+        mappedData.__mappedFields[mappingType] = {
+          fieldId,
+          value: fieldValue,
+          label: field.label,
+          stableId: field.stableId
+        };
+        
+        // Special handling for firstName and lastName
+        if (mappingType === 'name' && field.label && field.label.toLowerCase() === 'first name') {
+          console.log(`[MAPPING] Correcting mapping type from 'name' to 'firstName' for field: ${field.label}`);
+          mappingType = 'firstName';
+          mappedData.__mappedFields['firstName'] = {
+            fieldId,
+            value: fieldValue,
+            label: field.label,
+            stableId: field.stableId
+          };
+          mappedData['first_name'] = fieldValue;
+        } else if (mappingType === 'custom' && field.label && field.label.toLowerCase() === 'last name') {
+          console.log(`[MAPPING] Correcting mapping type from 'custom' to 'lastName' for field: ${field.label}`);
+          mappingType = 'lastName';
+          mappedData.__mappedFields['lastName'] = {
+            fieldId,
+            value: fieldValue,
+            label: field.label,
+            stableId: field.stableId
+          };
+          mappedData['last_name'] = fieldValue;
+        }
+        
+        mappedData[mappingType] = fieldValue;
+        mappedFields.add(fieldId);
+        continue;
+      }
+      
+      // 2. Field type strategy
+      const typeResult = fieldTypeStrategy(field, fieldId, fieldValue);
+      if (typeResult) {
+        mappingType = typeResult.mappedKey;
+        if (options.logMappingProcess) {
+          logger.info(`Mapped field ${fieldId} using type strategy: ${mappingType}`, 'forms');
+        }
+        console.log(`[MAPPING] Mapped field ${fieldId} to ${mappingType} using field-type strategy`);
+        
+        // Store the mapping in the __mappedFields object
+        mappedData.__mappedFields[mappingType] = {
+          fieldId,
+          value: fieldValue,
+          label: field.label,
+          stableId: field.stableId
+        };
+        
+        mappedData[mappingType] = fieldValue;
+        mappedFields.add(fieldId);
+        continue;
+      }
+      
+      // 3. Field label strategy
+      const labelResult = fieldLabelStrategy(field, fieldId, fieldValue);
+      if (labelResult) {
+        mappingType = labelResult.mappedKey;
+        if (options.logMappingProcess) {
+          logger.info(`Mapped field ${fieldId} using label strategy: ${mappingType}`, 'forms');
+        }
+        console.log(`[MAPPING] Mapped field ${fieldId} to ${mappingType} using field-label strategy`);
+        
+        // Store the mapping in the __mappedFields object
+        mappedData.__mappedFields[mappingType] = {
+          fieldId,
+          value: fieldValue,
+          label: field.label,
+          stableId: field.stableId
+        };
+        
+        mappedData[mappingType] = fieldValue;
+        mappedFields.add(fieldId);
+        continue;
+      }
+      
+      // 4. Field ID strategy
+      const idResult = fieldIdStrategy(field, fieldId, fieldValue);
+      if (idResult) {
+        mappingType = idResult.mappedKey;
+        if (options.logMappingProcess) {
+          logger.info(`Mapped field ${fieldId} using ID strategy: ${mappingType}`, 'forms');
+        }
+        console.log(`[MAPPING] Mapped field ${fieldId} to ${mappingType} using field-id strategy`);
+        
+        // Store the mapping in the __mappedFields object
+        mappedData.__mappedFields[mappingType] = {
+          fieldId,
+          value: fieldValue,
+          label: field.label,
+          stableId: field.stableId
+        };
+        
+        mappedData[mappingType] = fieldValue;
+        mappedFields.add(fieldId);
+        continue;
+      }
+      
+      // 5. Value pattern strategy (lowest precedence)
+      const patternResult = valuePatternStrategy(field, fieldId, fieldValue);
+      if (patternResult) {
+        mappingType = patternResult.mappedKey;
+        if (options.logMappingProcess) {
+          logger.info(`Mapped field ${fieldId} using value pattern strategy: ${mappingType}`, 'forms');
+        }
+        console.log(`[MAPPING] Mapped field ${fieldId} to ${mappingType} using value-pattern strategy`);
+        
+        // Store the mapping in the __mappedFields object
+        mappedData.__mappedFields[mappingType] = {
+          fieldId,
+          value: fieldValue,
+          label: field.label,
+          stableId: field.stableId
+        };
+        
+        mappedData[mappingType] = fieldValue;
+        mappedFields.add(fieldId);
+        continue;
+      }
+    }
+  }
+  
+  // If we have first_name and last_name but no name, combine them
+  if (!mappedData.name && (mappedData.first_name || mappedData.last_name)) {
+    const firstName = mappedData.first_name || '';
+    const lastName = mappedData.last_name || '';
+    mappedData.name = `${firstName} ${lastName}`.trim();
+    console.log(`[MAPPING] Combined first_name "${firstName}" and last_name "${lastName}" into name "${mappedData.name}"`);
+    
+    // Update the __mappedFields object
+    if (!mappedData.__mappedFields.name) {
+      mappedData.__mappedFields.name = {
+        fieldId: 'combined',
+        value: mappedData.name,
+        label: 'Combined Name',
+        stableId: 'combined'
+      };
+    }
+  }
+  
+  // For fields that couldn't be mapped using the standard strategies,
+  // try to extract contact information directly from the form data
+  if (!mappedData.email || !mappedData.name || !mappedData.phone) {
+    const contactInfo = extractContactInfo(formData);
+    
+    if (!mappedData.email && contactInfo.email) {
+      mappedData.email = contactInfo.email;
+      if (options.logMappingProcess) {
+        logger.info(`Extracted email from raw data: ${contactInfo.email}`, 'forms');
+      }
+    }
+    
+    if (!mappedData.name && contactInfo.name) {
+      mappedData.name = contactInfo.name;
+      if (options.logMappingProcess) {
+        logger.info(`Extracted name from raw data: ${contactInfo.name}`, 'forms');
+      }
+    }
+    
+    if (!mappedData.phone && contactInfo.phone) {
+      mappedData.phone = contactInfo.phone;
+      if (options.logMappingProcess) {
+        logger.info(`Extracted phone from raw data: ${contactInfo.phone}`, 'forms');
+      }
+    }
+  }
+  
+  // Include raw data if requested
+  if (options.includeRawData) {
+    Object.keys(formData).forEach(fieldId => {
+      const key = `raw_${fieldId}`;
+      mappedData[key] = formData[fieldId];
+    });
+  }
+  
+  if (options.logMappingProcess) {
+    logger.info(`Final mapped data: ${JSON.stringify(mappedData)}`, 'forms');
+  }
+  
+  // Log the final mapped data
+  console.log(`[MAPPING] Final mapped data:`, {
+    email: mappedData.email,
+    name: mappedData.name,
+    first_name: mappedData.first_name,
+    last_name: mappedData.last_name,
+    phone: mappedData.phone,
+    mappedFieldsKeys: Object.keys(mappedData.__mappedFields || {})
+  });
+  
+  // Return the mapped data
+  return mappedData;
+};
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\services\submission\bookingService.ts
+
+import { prisma } from '../../../../lib/prisma';
+import * as logger from '@/util/logger';
+import { validateBookingFields } from '@/lib/forms2/services/validation';
+
+/**
+ * Processes datetime information from form data
+ * @param mappedData The mapped form data
+ * @returns Processed date and time information
+ */
+export const processBookingDateTime = (
+  mappedData: Record<string, any>
+): { bookingDate: Date; bookingTime: string | null } => {
+  let bookingDate: Date;
+  let bookingTime: string | null = null;
+  
+  if (mappedData.datetime) {
+    try {
+      const dateTimeObj = new Date(mappedData.datetime);
+      bookingDate = dateTimeObj;
+      const hours = dateTimeObj.getHours();
+      const minutes = dateTimeObj.getMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      const formattedHours = hours % 12 || 12;
+      const formattedMinutes = minutes < 10 ? `0${minutes}` : minutes;
+      bookingTime = `${formattedHours}:${formattedMinutes} ${ampm}`;
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Error parsing datetime: ' + errorMessage, 'forms');
+      throw new Error('Invalid date and time format. Please select a valid date and time.');
+    }
+  } else {
+    // If no date is provided, use the current date instead of throwing an error
+    if (!mappedData.date) {
+      logger.info('No date provided for booking form submission, using current date', 'forms');
+      bookingDate = new Date();
+    } else {
+      bookingDate = new Date(mappedData.date);
+    }
+    
+    bookingTime = mappedData.time;
+  }
+  
+  return { bookingDate, bookingTime };
+};
+
+/**
+ * Creates a booking from the mapped form data
+ * @param formId The form ID
+ * @param mappedData The mapped form data
+ * @returns The created booking ID
+ */
+export const createBookingFromFormData = async (
+  formId: string,
+  mappedData: Record<string, any>,
+  rawFormData?: Record<string, any>
+): Promise<string> => {
+  logger.info(`Creating booking for booking form: ${formId}`, 'forms');
+  
+  // If we have raw form data, try to extract missing fields directly from it
+  if (rawFormData && (!mappedData.email || !mappedData.name || !mappedData.phone || !mappedData.date)) {
+    logger.info(`Attempting to extract missing fields from raw form data`, 'forms');
+    
+    // Extract fields from raw form data
+    for (const [fieldId, value] of Object.entries(rawFormData)) {
+      if (!value || typeof value !== 'string') continue;
+      
+      // Look for email fields
+      if (!mappedData.email && (
+          fieldId.toLowerCase().includes('email') || 
+          (typeof value === 'string' && value.includes('@') && value.includes('.'))
+      )) {
+        mappedData.email = value;
+        logger.info(`Extracted email from raw data: ${value}`, 'forms');
+      }
+      
+      // Look for name fields
+      if (!mappedData.name && (
+          fieldId.toLowerCase().includes('name') && 
+          !fieldId.toLowerCase().includes('last') && 
+          !fieldId.toLowerCase().includes('first')
+      )) {
+        mappedData.name = value;
+        logger.info(`Extracted name from raw data: ${value}`, 'forms');
+      }
+      
+      // Look for phone fields
+      if (!mappedData.phone && (
+          fieldId.toLowerCase().includes('phone') || 
+          fieldId.toLowerCase().includes('tel')
+      )) {
+        mappedData.phone = value;
+        logger.info(`Extracted phone from raw data: ${value}`, 'forms');
+      }
+      
+      // Look for date fields
+      if (!mappedData.date && (
+          fieldId.toLowerCase().includes('date') ||
+          (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value))
+      )) {
+        mappedData.date = value;
+        logger.info(`Extracted date from raw data: ${value}`, 'forms');
+      }
+    }
+  }
+  
+  // Validate booking fields
+  validateBookingFields(mappedData);
+  
+  // Process date and time
+  const { bookingDate, bookingTime } = processBookingDateTime(mappedData);
+  
+  // Get location information
+  const bookingLocation = mappedData.location || mappedData.location_office || null;
+  
+  // Extract email, name, and phone from the mapped data
+  const email = mappedData.email || '';
+  const name = mappedData.name || '';
+  const phone = mappedData.phone || null;
+  
+  // Email and name are required for bookings according to the schema
+  if (!email) throw new Error('Email is required for bookings');
+  if (!name) throw new Error('Name is required for bookings');
+  
+  logger.info(`Creating booking with: email=${email}, name=${name}, phone=${phone}, date=${bookingDate}, time=${bookingTime}, location=${bookingLocation}`, 'forms');
+  
+  // Create the booking
+  const booking = await prisma.booking.create({
+    data: {
+      email,
+      name,
+      phone,
+      date: bookingDate,
+      time: bookingTime,
+      location: bookingLocation,
+      formId,
+      status: 'PENDING',
+    },
+  });
+  
+  logger.info(`Booking created: ${booking.id}`, 'forms');
+  return booking.id;
+};
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\services\mapping\contactInfoExtractor.ts
+
+/**
+ * Contact Information Extractor
+ * 
+ * This file contains utilities for extracting contact information from form data.
+ */
+
+import * as logger from '@/util/logger';
+import { isValidEmail } from '@/util/validation';
+import { ContactInfoResult } from './types';
+
+/**
+ * Attempts to extract email, name, and phone directly from form data
+ * This is a fallback mechanism when explicit mapping fails
+ * 
+ * @param formData The raw form data
+ * @returns Extracted data with email, name, and phone
+ */
+export const extractContactInfo = (
+  formData: Record<string, any>
+): ContactInfoResult => {
+  let foundEmail: string | null = null;
+  let foundName: string | null = null;
+  let foundPhone: string | null = null;
+  
+  // Also track first and last name separately in case we need to combine them
+  let foundFirstName: string | null = null;
+  let foundLastName: string | null = null;
+  
+  logger.info(`Attempting to extract contact info from raw form data`, 'forms');
+  
+  // First pass: look for fields with obvious names
+  Object.entries(formData).forEach(([key, value]) => {
+    if (!value || typeof value !== 'string') return;
+    
+    const lowerKey = key.toLowerCase();
+    
+    // Look for name in key
+    if (!foundName && (
+        lowerKey === 'name' ||
+        lowerKey === 'fullname' ||
+        lowerKey === 'full_name' ||
+        lowerKey === 'full-name' ||
+        (lowerKey.includes('name') && !lowerKey.includes('first') && !lowerKey.includes('last'))
+      )) {
+      foundName = value;
+      logger.info(`Found potential name in field ${key}: ${value}`, 'forms');
+    }
+    
+    // Look for first name in key
+    if (!foundFirstName && (
+        lowerKey === 'firstname' ||
+        lowerKey === 'first_name' ||
+        lowerKey === 'first-name' ||
+        (lowerKey.includes('first') && lowerKey.includes('name'))
+      )) {
+      foundFirstName = value;
+      logger.info(`Found potential first name in field ${key}: ${value}`, 'forms');
+    }
+    
+    // Look for last name in key
+    if (!foundLastName && (
+        lowerKey === 'lastname' ||
+        lowerKey === 'last_name' ||
+        lowerKey === 'last-name' ||
+        (lowerKey.includes('last') && lowerKey.includes('name') && !lowerKey.includes('first'))
+      )) {
+      foundLastName = value;
+      logger.info(`Found potential last name in field ${key}: ${value}`, 'forms');
+    }
+    
+    // Combine first and last name if both are found
+    if (!foundName && foundFirstName && foundLastName) {
+      foundName = `${foundFirstName} ${foundLastName}`;
+      logger.info(`Combined first and last name: ${foundName}`, 'forms');
+    } else if (!foundName && foundFirstName) {
+      foundName = foundFirstName;
+      logger.info(`Using first name as full name: ${foundName}`, 'forms');
+    } else if (!foundName && foundLastName) {
+      foundName = foundLastName;
+      logger.info(`Using last name as full name: ${foundName}`, 'forms');
+    }
+    
+    // Check for email pattern in key and value
+    if (!foundEmail && (
+        lowerKey.includes('email') || 
+        lowerKey.includes('mail')
+      ) && value.includes('@') && value.includes('.')) {
+      foundEmail = value;
+      logger.info(`Found potential email in field ${key}: ${value}`, 'forms');
+    }
+    
+    // Look for phone pattern in key and value
+    if (!foundPhone && (
+        lowerKey.includes('phone') || 
+        lowerKey.includes('tel') || 
+        lowerKey.includes('mobile')
+      )) {
+      // Make sure it's not a date field (dates often have format YYYY-MM-DD)
+      const isLikelyDate = /^\d{4}-\d{1,2}-\d{1,2}/.test(value) || // ISO date format
+                          /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(value); // MM/DD/YYYY or similar
+      
+      // Check if it looks like a phone number
+      const isLikelyPhone = /^[\d\s\+\-\(\)]{7,}$/.test(value) && 
+                           !isLikelyDate;
+      
+      if (isLikelyPhone) {
+        foundPhone = value;
+        logger.info(`Found potential phone in field ${key}: ${value}`, 'forms');
+      } else if (isLikelyDate) {
+        logger.info(`Skipping date-like value in field ${key}: ${value}`, 'forms');
+      }
+    }
+  });
+  
+  // Second pass: look for values that match patterns if we haven't found them yet
+  if (!foundEmail || !foundName || !foundPhone) {
+    Object.entries(formData).forEach(([key, value]) => {
+      if (!value || typeof value !== 'string') return;
+      
+      // Check for email pattern with better validation
+      if (!foundEmail && isValidEmail(value)) {
+        foundEmail = value;
+        logger.info(`Found potential email in field ${key}: ${value}`, 'forms');
+      }
+      
+      // Look for phone pattern (numbers with some separators)
+      if (!foundPhone) {
+        // Make sure it's not a date field (dates often have format YYYY-MM-DD)
+        const isLikelyDate = /^\d{4}-\d{1,2}-\d{1,2}/.test(value) || // ISO date format
+                            /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(value) || // MM/DD/YYYY or similar
+                            /^\d{4}$/.test(value); // Just a year
+        
+        // Check if it looks like a phone number
+        const isLikelyPhone = /^[\d\s\+\-\(\)]{7,}$/.test(value) && 
+                             !isLikelyDate &&
+                             (value.includes('+') || value.includes('(') || value.includes(')') || 
+                              value.includes('-') || value.length > 9);
+        
+        if (isLikelyPhone) {
+          foundPhone = value;
+          logger.info(`Found potential phone in field ${key}: ${value}`, 'forms');
+        } else if (isLikelyDate) {
+          logger.info(`Skipping date-like value in field ${key}: ${value}`, 'forms');
+        }
+      }
+      
+      // Name detection - more aggressive in second pass
+      if (!foundName) {
+        // Check if it looks like a name with more sophisticated pattern matching
+        // Names typically have spaces between first and last name, contain alphabetic characters,
+        // may have apostrophes or hyphens, and are not too long
+        if (typeof value === 'string' && value.trim() !== '') {
+          // Check for a typical full name pattern (first and last name with space)
+          if (value.includes(' ') && value.length < 50 && 
+              /^[A-Za-z\s\.'\-]+$/.test(value) && 
+              !/^[\d\s\+\-\(\)]+$/.test(value) &&
+              !value.includes('@')) {
+            foundName = value;
+            logger.info(`Found potential full name in field ${key}: ${value}`, 'forms');
+          }
+          // Check for single name (first name only)
+          else if (value.length > 1 && value.length < 30 && 
+                  /^[A-Za-z\.'\-]+$/.test(value) &&
+                  !value.includes('@') && 
+                  !/^[\d\s\+\-\(\)]+$/.test(value)) {
+            foundName = value;
+            logger.info(`Found potential single name in field ${key}: ${value}`, 'forms');
+          }
+          // Check for name patterns with titles (Mr., Mrs., Dr., etc.)
+          else if (value.length < 50 && 
+                  /^(Mr\.|Mrs\.|Ms\.|Dr\.|Prof\.)\s[A-Za-z\s\.'\-]+$/.test(value)) {
+            foundName = value;
+            logger.info(`Found potential name with title in field ${key}: ${value}`, 'forms');
+          }
+        }
+      }
+    });
+  }
+  
+  return { email: foundEmail, name: foundName, phone: foundPhone };
+};
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\services\submission\submissionService2.ts
+
+/**
+ * Form System 2.0 Submission Service
+ * 
+ * This service handles form submissions for Form System 2.0.
+ * It processes form data, creates leads and bookings, and handles email automations.
+ * This implementation uses only the Forms2 ecosystem with no legacy systems.
+ */
+
+import { prisma } from '../../../../lib/prisma';
+import * as logger from '@/util/logger';
+import { v4 as uuidv4 } from 'uuid';
+import { validateFormSubmission, ValidationResult } from '../validation';
+import { createLeadFromFormData } from './leadService';
+import { createBookingFromFormData } from './bookingService';
+import { SubmissionRepository } from '../../repositories/submissionRepository';
+import { mapFormFields } from '../mapping/index';
+
+// Import only from the Forms2 email processing system
+import { processEmailRules2 } from '../email-processing';
+
+const submissionRepository = new SubmissionRepository();
+
+/**
+ * Submission Service for Form System 2.0
+ * 
+ * This service handles form submissions, including:
+ * - Form validation
+ * - Lead creation
+ * - Booking creation
+ * - Email automations
+ */
+export class SubmissionService {
+  /**
+   * Process a form submission
+   * 
+   * @param formId The ID of the form
+   * @param formData The form data
+   * @param trackingToken Optional tracking token
+   * @param timeStamp Optional timestamp
+   * @param source Optional source of the submission
+   * @param processEmails Optional flag to process emails synchronously (default: true)
+   * @returns The result of the submission processing
+   */
+  async processSubmission(
+    formId: string,
+    formData: Record<string, any>,
+    trackingToken?: string,
+    timeStamp?: string,
+    source?: string,
+    processEmails: boolean = true
+  ) {
+    try {
+      logger.info(`Processing form submission for form: ${formId}`, 'forms');
+      
+      // Get the form configuration for validation
+      const validationFormConfig: any = {
+        id: formId,
+        title: 'Form',
+        version: 'modern' as const,
+        sections: [],
+        metadata: { formType: 'INQUIRY' }
+      };
+      
+      // Validate the form data
+      const validationResult = validateFormSubmission(validationFormConfig, formData);
+      
+      if (!validationResult.isValid) {
+        const errorMessages = Object.values(validationResult.errors || {}).filter(Boolean);
+        logger.warn(`Form validation failed: ${errorMessages.join(', ')}`, 'forms');
+        return {
+          success: false,
+          message: `Form validation failed: ${errorMessages.join(', ')}`
+        };
+      }
+      
+      // Get the form to determine its type
+      const form = await prisma.form.findUnique({
+        where: { id: formId },
+        select: {
+          id: true,
+          type: true,
+          name: true,
+          fields: true
+        }
+      });
+      
+      if (!form) {
+        logger.error(`Form not found: ${formId}`, 'forms');
+        return {
+          success: false,
+          message: 'Form not found'
+        };
+      }
+      
+      logger.info(`Processing form with type: ${form.type}`, 'forms');
+      logger.info(`Raw form data: ${JSON.stringify(formData)}`, 'forms');
+      
+      // Get form sections for field mapping
+      const formSections = await prisma.formSection.findMany({
+        where: { formId },
+        select: {
+          id: true,
+          title: true,
+          order: true,
+          fields: true
+        }
+      });
+      
+      // Create a form config object for field mapping
+      const mappingFormConfig: any = {
+        id: formId,
+        title: form.name || 'Form',
+        version: 'modern' as const,
+        sections: formSections.map(section => {
+          // Ensure we have the required fields for a FormSection
+          const sectionTitle = section.title || 'Section';
+          const sectionOrder = section.order || 0;
+          const sectionFields = typeof section.fields === 'string' 
+            ? JSON.parse(section.fields) 
+            : (Array.isArray(section.fields) ? section.fields : []);
+          
+          return {
+            id: section.id,
+            title: sectionTitle,
+            order: sectionOrder,
+            fields: sectionFields
+          };
+        })
+      };
+      
+      // Map form fields to standard fields (name, email, phone, etc.)
+      const mappedData = mapFormFields(mappingFormConfig, formData, { logMappingProcess: true });
+      logger.info(`Final mapped data: ${JSON.stringify(mappedData)}`, 'forms');
+      
+      // Variables to store IDs for created resources
+      let leadId: string | null = null;
+      let bookingId: string | null = null;
+      
+      // Create a lead if this is an inquiry form
+      if (form.type === 'INQUIRY') {
+        logger.info(`Creating lead for inquiry form: ${formId}`, 'forms');
+        
+        // Create a lead from the form data
+        const leadId2 = await createLeadFromFormData(formId, mappedData, formData);
+        
+        if (leadId2) {
+          leadId = leadId2;
+          logger.info(`Lead created: ${leadId}`, 'forms');
+        }
+      }
+      
+      // Create a booking if this is a booking form
+      if (form.type === 'BOOKING') {
+        logger.info(`Creating booking for booking form: ${formId}`, 'forms');
+        
+        // Create a booking from the form data
+        const bookingId2 = await createBookingFromFormData(formId, mappedData, formData);
+        
+        if (bookingId2) {
+          bookingId = bookingId2;
+          logger.info(`Booking created: ${bookingId}`, 'forms');
+        }
+      }
+      
+      // Enhance formData with section information for better organization in the UI
+      const enhancedFormData = this.enhanceFormDataWithSections(formData, formSections);
+      
+      // Create the submission record
+      const submission = await submissionRepository.createSubmission({
+        formId,
+        data: enhancedFormData,
+        ...(leadId ? { leadId } : {}),
+        ...(bookingId ? { bookingId } : {}),
+        trackingToken,
+        timeStamp
+      });
+      
+      // Process email automations using Form System 2.0 (if enabled)
+      if (processEmails) {
+        logger.info(`Processing email automations synchronously for submission: ${submission.id}`, 'forms');
+        await this.processEmailAutomations2(submission.id, formId, source);
+      } else {
+        logger.info(`Skipping synchronous email processing for submission: ${submission.id}`, 'forms');
+      }
+      
+      return {
+        submissionId: submission.id,
+        leadId,
+        bookingId,
+        success: true,
+        message: 'Form submitted successfully'
+      };
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error(`Error processing form submission: ${errorMessage}`, 'forms');
+      throw error;
+    }
+  }
+  
+  /**
+   * Enhance form data with section information
+   * 
+   * @param formData The form data
+   * @param formSections The form sections
+   * @returns The enhanced form data
+   */
+  private enhanceFormDataWithSections(
+    formData: Record<string, any>,
+    formSections: { id: string; fields: any }[]
+  ): Record<string, any> {
+    // If there are no form sections, return the original form data
+    if (!formSections || formSections.length === 0) {
+      return formData;
+    }
+    
+    // Create a copy of the form data
+    const enhancedData = { ...formData };
+    
+    // Add section information to the form data
+    enhancedData.__sections = formSections.map(section => {
+      const fields = typeof section.fields === 'string' 
+        ? JSON.parse(section.fields) 
+        : section.fields;
+      
+      return {
+        id: section.id,
+        fields
+      };
+    });
+    
+    return enhancedData;
+  }
+  
+  /**
+   * Public method to process email automations asynchronously
+   * 
+   * @param submissionId The ID of the form submission
+   * @param formId The ID of the form
+   * @param source Optional source of the submission
+   */
+  async processEmailsAsync(submissionId: string, formId: string, source?: string) {
+    return this.processEmailAutomations2(submissionId, formId, source);
+  }
+
+  /**
+   * Process email automations for a form submission using Form System 2.0
+   * 
+   * @param submissionId The ID of the form submission
+   * @param formId The ID of the form
+   * @param source Optional source of the submission
+   */
+  private async processEmailAutomations2(submissionId: string, formId: string, source?: string) {
+    try {
+      logger.info(`[FORMS2] Processing email automations for submission: ${submissionId}`, 'forms');
+      
+      // Generate a correlation ID for tracking this processing request
+      const correlationId = uuidv4();
+      logger.info(`[FORMS2] Generated correlation ID: ${correlationId}`, 'forms');
+      
+      // Get the submission data
+      const submission = await prisma.formSubmission.findUnique({
+        where: { id: submissionId },
+        select: {
+          id: true,
+          formId: true,
+          data: true,
+          leadId: true
+        }
+      });
+      
+      if (!submission) {
+        logger.error(`[FORMS2] Submission not found: ${submissionId}`, 'forms');
+        return;
+      }
+      
+      // Parse the submission data
+      const formData = typeof submission.data === 'string' 
+        ? JSON.parse(submission.data) 
+        : submission.data;
+      
+      // Enhance the form data with additional context
+      let enhancedData = { ...formData };
+      
+      // Add submission ID to the enhanced data
+      enhancedData.submissionId = submission.id;
+      
+      // If there's a lead ID, try to fetch the lead data
+      if (submission.leadId) {
+        try {
+          const lead = await prisma.lead.findUnique({
+            where: { id: submission.leadId }
+          });
+          
+          if (lead) {
+            logger.info(`[FORMS2] Found lead: ${lead.name || 'Unnamed'}`, 'forms');
+            // Add lead data to the enhanced data object
+            enhancedData = {
+              ...enhancedData,
+              leadId: lead.id,
+              name: lead.name || undefined,
+              email: lead.email || undefined,
+              phone: lead.phone || undefined,
+              // Extract first name from full name if available
+              firstName: lead.name ? lead.name.split(' ')[0] : undefined
+            };
+          }
+        } catch (error) {
+          logger.error(`[FORMS2] Error fetching lead data: ${error instanceof Error ? error.message : String(error)}`, 'forms');
+        }
+      }
+      
+      logger.info(`[FORMS2] Processing email rules for form: ${submission.formId}, submission: ${submission.id}`, 'forms');
+      
+      // Process email rules using the Forms2 email processing system
+      const result = await processEmailRules2({
+        formId: submission.formId,
+        submissionId: submission.id,
+        data: enhancedData,
+        correlationId
+      });
+      
+      // Log the results
+      if (result.success) {
+        logger.info(`[FORMS2] Email processing successful: processed ${result.processedRules} rules, queued ${result.queuedEmails} emails`, 'forms');
+      } else {
+        logger.error(`[FORMS2] Email processing failed: ${result.error}`, 'forms');
+      }
+      
+      // Return the result for potential use by the caller
+      return result;
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error(`[FORMS2] Error processing email automations: ${errorMessage}`, 'forms');
+      
+      // Return an error result
+      return {
+        success: false,
+        processedRules: 0,
+        queuedEmails: 0,
+        correlationId: uuidv4(),
+        logs: [{
+          type: 'error',
+          message: `Error processing email automations: ${errorMessage}`,
+          timestamp: new Date().toISOString()
+        }],
+        error: errorMessage
+      };
+    }
+  }
+}
+
+export const submissionService = new SubmissionService();
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\repositories\leadBookingRepository.ts
+
+/**
+ * Lead and Booking Repository
+ * 
+ * This file contains the repository for lead and booking operations.
+ */
+
+import { Lead, Booking } from '@prisma/client';
+import { BaseRepository } from './baseRepository';
+import { prisma } from '../../../lib/prisma';
+import { FormSubmissionData } from '../core/types';
+import { SubmissionRepository } from './submissionRepository';
+
+export class LeadBookingRepository extends BaseRepository {
+  private submissionRepository: SubmissionRepository;
+
+  constructor() {
+    super();
+    this.submissionRepository = new SubmissionRepository();
+  }
+
+  /**
+   * Create a lead from form submission data
+   */
+  async createLead(formId: string, submissionData: FormSubmissionData, submissionId?: string): Promise<Lead> {
+    // Process the submission data to extract mapped fields
+    const processedData = await this.submissionRepository.processSubmissionData(formId, submissionData);
+    
+    // Log the raw submission data for debugging
+    console.log(`[DEBUG] Lead Creation - Raw submission data:`, {
+      hasSubmissionData: !!submissionData,
+      hasMappedFields: !!(submissionData && submissionData.__mappedFields),
+      submissionDataKeys: Object.keys(submissionData || {})
+    });
+    
+    // Log the processed data received from processSubmissionData
+    console.log(`[DEBUG] Lead Creation - Processed data from processSubmissionData:`, {
+      name: processedData.name,
+      firstName: processedData.firstName,
+      lastName: processedData.lastName,
+      email: processedData.email,
+      phone: processedData.phone
+    });
+    
+    // Extract lead data from processed data
+    const { name, firstName, lastName, email, phone, ...additionalData } = processedData;
+    
+    // Determine the best name to use for the lead
+    // Start with null instead of name to prioritize firstName + lastName combination
+    let leadName = null;
+    
+    console.log(`[DEBUG] Lead Creation - Initial raw name value: "${name || 'undefined'}"`);
+    
+    // If we have first name and/or last name, combine them (prioritize this over other name fields)
+    if (firstName || lastName) {
+      if (firstName && lastName) {
+        leadName = `${firstName} ${lastName}`;
+        console.log(`[DEBUG] Combined first name "${firstName}" and last name "${lastName}" into full name "${leadName}"`);
+      } else if (firstName) {
+        leadName = firstName;
+        console.log(`[DEBUG] Using first name "${firstName}" as lead name`);
+      } else if (lastName) {
+        leadName = lastName;
+        console.log(`[DEBUG] Using last name "${lastName}" as lead name`);
+      }
+    }
+    
+    // If we still don't have a name, check if we have mappedFields in the original submission data
+    if (!leadName && submissionData.__mappedFields) {
+      const mappedFields = submissionData.__mappedFields as any;
+      console.log(`[DEBUG] Lead Creation - Checking mappedFields:`, mappedFields);
+      
+      // Try to extract name from mappedFields
+      if (mappedFields.name?.value) {
+        leadName = mappedFields.name.value;
+        console.log(`[DEBUG] Lead Creation - Using name from mappedFields: "${leadName}"`);
+      }
+      
+      // Try to combine firstName and lastName from mappedFields
+      else if (mappedFields.firstName?.value || mappedFields.lastName?.value) {
+        const firstNameValue = mappedFields.firstName?.value;
+        const lastNameValue = mappedFields.lastName?.value;
+        
+        if (firstNameValue && lastNameValue) {
+          leadName = `${firstNameValue} ${lastNameValue}`;
+          console.log(`[DEBUG] Lead Creation - Combined firstName "${firstNameValue}" and lastName "${lastNameValue}" from mappedFields into "${leadName}"`);
+        } else if (firstNameValue) {
+          leadName = firstNameValue;
+          console.log(`[DEBUG] Lead Creation - Using firstName from mappedFields: "${leadName}"`);
+        } else if (lastNameValue) {
+          leadName = lastNameValue;
+          console.log(`[DEBUG] Lead Creation - Using lastName from mappedFields: "${leadName}"`);
+        }
+      }
+    }
+    
+    // If we still don't have a name, fall back to the original name field
+    if (!leadName) {
+      leadName = name;
+      console.log(`[DEBUG] Lead Creation - Falling back to original name field: "${leadName || 'undefined'}"`);  
+    }
+    
+    console.log(`[DEBUG] FINAL Creating lead with name: "${leadName || 'Unknown'}", email: ${email || 'null'}, phone: ${phone || 'null'}`);
+    
+    // Create the lead with properly typed data according to Prisma schema
+    const leadData: any = {
+      name: leadName || 'Unknown',
+      email: email || null,
+      phone: phone || null,
+      status: 'NEW',
+      source: 'FORM',
+      formId: formId,
+    };
+    
+    // Add submission connection if provided
+    if (submissionId) {
+      leadData.submissions = {
+        connect: { id: submissionId }
+      };
+    }
+    
+    // Add metadata as string
+    leadData.metadata = JSON.stringify({
+      formData: submissionData,
+      additionalData,
+      firstName,
+      lastName
+    });
+    
+    // Create the lead
+    const lead = await prisma.lead.create({
+      data: leadData,
+    });
+    
+    return lead;
+  }
+
+  /**
+   * Create a booking from form submission data
+   */
+  async createBooking(formId: string, submissionData: FormSubmissionData, submissionId?: string): Promise<Booking> {
+    // Process the submission data to extract mapped fields
+    const processedData = await this.submissionRepository.processSubmissionData(formId, submissionData);
+    
+    // Extract booking data from processed data
+    const { 
+      name, 
+      email, 
+      phone, 
+      date, 
+      time, 
+      datetime, 
+      location, 
+      location_office,
+      ...additionalData 
+    } = processedData;
+    
+    // Determine the booking date and time
+    let bookingDate: Date | null = null;
+    let bookingTime: string | null = null;
+    
+    if (datetime) {
+      // If datetime is provided, use it
+      const dateTimeObj = new Date(datetime);
+      bookingDate = dateTimeObj;
+      bookingTime = dateTimeObj.toTimeString().substring(0, 5); // HH:MM format
+    } else if (date) {
+      // If separate date is provided
+      bookingDate = new Date(date);
+      
+      // If time is also provided, set it
+      if (time) {
+        bookingTime = time;
+        
+        // Update the date with the time
+        const [hours, minutes] = time.split(':').map(Number);
+        bookingDate.setHours(hours, minutes);
+      }
+    }
+    
+    // Create booking data with proper types according to Prisma schema
+    const bookingData: any = {
+      title: `Booking for ${name || 'Unknown'}`,
+      customerName: name || 'Unknown',
+      customerEmail: email || null,
+      customerPhone: phone || null,
+      // Ensure date is either a valid Date or a string, not null
+      date: bookingDate || undefined,
+      time: bookingTime,
+      location: location || location_office || null,
+      status: 'PENDING',
+      formId: formId,
+      metadata: JSON.stringify({
+        formData: submissionData,
+        additionalData
+      })
+    };
+    
+    // Add submission connection if provided
+    if (submissionId) {
+      bookingData.submissions = {
+        connect: { id: submissionId }
+      };
+    }
+    
+    // Create the booking
+    const booking = await prisma.booking.create({
+      data: bookingData
+    });
+    
+    return booking;
+  }
+
+  /**
+   * Get all leads for a form
+   */
+  async getLeadsByFormId(formId: string): Promise<Lead[]> {
+    return prisma.lead.findMany({
+      where: {
+        formId,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+  }
+
+  /**
+   * Get all bookings for a form
+   */
+  async getBookingsByFormId(formId: string): Promise<Booking[]> {
+    return prisma.booking.findMany({
+      where: {
+        formId,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+  }
+
+  /**
+   * Update a lead
+   */
+  async updateLead(id: string, data: Partial<Lead>): Promise<Lead> {
+    // Extract fields that need to be stringified
+    const { metadata, ...restData } = data as any;
+    
+    return prisma.lead.update({
+      where: {
+        id,
+      },
+      data: {
+        ...restData,
+        ...(metadata && { metadata: JSON.stringify(metadata) }),
+      },
+    });
+  }
+
+  /**
+   * Update a booking
+   */
+  async updateBooking(id: string, data: Partial<Booking>): Promise<Booking> {
+    // Extract fields that need to be stringified
+    const { metadata, ...restData } = data as any;
+    
+    return prisma.booking.update({
+      where: {
+        id,
+      },
+      data: {
+        ...restData,
+        ...(metadata && { metadata: JSON.stringify(metadata) }),
+      },
+    });
+  }
+
+  /**
+   * Delete a lead
+   */
+  async deleteLead(id: string): Promise<Lead> {
+    return prisma.lead.delete({
+      where: {
+        id,
+      },
+    });
+  }
+
+  /**
+   * Delete a booking
+   */
+  async deleteBooking(id: string): Promise<Booking> {
+    return prisma.booking.delete({
+      where: {
+        id,
+      },
+    });
+  }
+}
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\repositories\submissionRepository.ts
+
+/**
+ * Submission Repository
+ * 
+ * This file contains the repository for form submission operations.
+ */
+
+import { FormSubmission } from '@prisma/client';
+import { BaseRepository } from './baseRepository';
+import { prisma } from '../../../lib/prisma';
+import { FormSubmissionData } from '../core/types';
+
+export class SubmissionRepository extends BaseRepository {
+  /**
+   * Create a new form submission
+   */
+  async createSubmission(data: {
+    formId: string;
+    data: FormSubmissionData;
+    leadId?: string;
+    bookingId?: string;
+    sourceLeadId?: string;
+    trackingToken?: string;
+    timeStamp?: string;
+  }): Promise<FormSubmission> {
+    const { formId, data: submissionData, leadId, bookingId, sourceLeadId, trackingToken, timeStamp } = data;
+    
+    // Clean the submission data to remove metadata
+    const cleanedData = this.cleanSubmissionData(submissionData);
+    console.log(`[SUBMISSION] Cleaned submission data. Original keys: ${Object.keys(submissionData).length}, Cleaned keys: ${Object.keys(cleanedData).length}`);
+    
+    // Log the cleaned data before storing it
+    console.log(`[DEBUG] SUBMISSION DATA BEFORE STORAGE:`, {
+      name: cleanedData.name,
+      firstName: cleanedData.firstName,
+      lastName: cleanedData.lastName,
+      email: cleanedData.email,
+      phone: cleanedData.phone,
+      hasMappedFields: !!cleanedData.__mappedFields,
+      mappedFieldsKeys: cleanedData.__mappedFields ? Object.keys(cleanedData.__mappedFields) : []
+    });
+    
+    // If we have a leadId and the cleaned data has a combined name, update the lead
+    if (leadId && cleanedData.firstName && cleanedData.lastName) {
+      try {
+        // Get the current lead
+        const lead = await prisma.lead.findUnique({
+          where: { id: leadId },
+          select: { name: true }
+        });
+        
+        // If the lead exists and its name doesn't match the combined name
+        if (lead && lead.name !== `${cleanedData.firstName} ${cleanedData.lastName}`) {
+          const combinedName = `${cleanedData.firstName} ${cleanedData.lastName}`;
+          console.log(`[SUBMISSION] Updating lead ${leadId} name from "${lead.name}" to "${combinedName}"`);
+          
+          // Update the lead with the combined name
+          await prisma.lead.update({
+            where: { id: leadId },
+            data: { name: combinedName }
+          });
+        }
+      } catch (error) {
+        console.error('Error updating lead name:', error);
+        // Don't fail the submission if lead update fails
+      }
+    }
+    
+    // Create the submission
+    const submission = await prisma.formSubmission.create({
+      data: {
+        formId,
+        data: JSON.stringify(cleanedData),
+        // Include optional fields if provided
+        ...(leadId ? { leadId } : {}),
+        ...(bookingId ? { bookingId } : {}),
+        ...(sourceLeadId ? { sourceLeadId } : {}),
+        ...(trackingToken ? { trackingToken } : {}),
+        ...(timeStamp ? { timeStamp } : {}),
+      },
+    });
+    
+    console.log(`[DEBUG] SUBMISSION CREATED with ID: ${submission.id}`);
+    
+    return submission;
+  }
+  
+  /**
+   * Clean submission data by removing excessive metadata while preserving essential structure
+   */
+  private cleanSubmissionData(data: FormSubmissionData): FormSubmissionData {
+    // Define types for section and field metadata
+    interface FormFieldMetadata {
+      id: string;
+      label: string;
+      type: string;
+      mapping: string | null;
+      stableId: string;
+      [key: string]: any;
+    }
+    
+    interface FormSectionMetadata {
+      id: string;
+      title?: string;
+      fields: FormFieldMetadata[];
+      [key: string]: any;
+    }
+    
+    // Create a new object to hold the cleaned data
+    const cleanedData: FormSubmissionData = {};
+    
+    // Add special fields for mapping purposes
+    cleanedData['__mappedFields'] = {};
+    
+    // Iterate through the data and keep field values
+    for (const key in data) {
+      // Handle section metadata specially
+      if (key === '__sections') {
+        // Extract minimal section information (just IDs and field associations)
+        const minimalSections = ((data.__sections as any[]) || []).map((section: FormSectionMetadata) => ({
+          id: section.id,
+          title: section.title,
+          fieldIds: (section.fields || []).map((field: FormFieldMetadata) => field.id)
+        }));
+        
+        // Store minimal section data
+        cleanedData['__sectionInfo'] = minimalSections;
+        continue;
+      }
+      
+      // Skip other metadata fields that start with __
+      if (key.startsWith('__') && key !== '__sectionInfo' && key !== '__mappedFields') {
+        continue;
+      }
+      
+      // Keep the actual field values
+      cleanedData[key] = data[key];
+    }
+    
+    // If we have section metadata, use it to identify mapped fields
+    if (data.__sections) {
+      try {
+        // Extract field mappings from sections
+        ((data.__sections as any[]) || []).forEach((section: FormSectionMetadata) => {
+          (section.fields || []).forEach((field: FormFieldMetadata) => {
+            if (field.mapping) {
+              try {
+                const mapping = JSON.parse(field.mapping);
+                if (mapping && mapping.type) {
+                  // Store mapping information
+                  const fieldId = field.id;
+                  const fieldValue = data[fieldId];
+                  
+                  if (fieldValue !== undefined) {
+                    // Special handling for fields with label 'First Name' or 'Last Name'
+                    let mappingType = mapping.type;
+                    
+                    // Check if this is a first name field based on the label
+                    if (field.label && field.label.toLowerCase() === 'first name' && mapping.type === 'name') {
+                      console.log(`[MAPPING] Correcting mapping type from 'name' to 'firstName' for field: ${field.label}`);
+                      mappingType = 'firstName';
+                    }
+                    
+                    // Check if this is a last name field based on the label
+                    if (field.label && field.label.toLowerCase() === 'last name' && mapping.type === 'custom') {
+                      console.log(`[MAPPING] Correcting mapping type from 'custom' to 'lastName' for field: ${field.label}`);
+                      mappingType = 'lastName';
+                    }
+                    
+                    // Special handling for fields with specific labels
+                    if (field.label && field.label.toLowerCase() === 'first name') {
+                      console.log(`[MAPPING] Setting firstName mapping for field: ${field.label} with value: ${fieldValue}`);
+                      // Add as firstName regardless of the original mapping type
+                      (cleanedData['__mappedFields'] as any)['firstName'] = {
+                        fieldId,
+                        value: fieldValue,
+                        label: field.label,
+                        stableId: field.stableId
+                      };
+                      // Also set the firstName property directly
+                      cleanedData['firstName'] = fieldValue;
+                    } else if (field.label && field.label.toLowerCase() === 'last name') {
+                      console.log(`[MAPPING] Setting lastName mapping for field: ${field.label} with value: ${fieldValue}`);
+                      // Add as lastName regardless of the original mapping type
+                      (cleanedData['__mappedFields'] as any)['lastName'] = {
+                        fieldId,
+                        value: fieldValue,
+                        label: field.label,
+                        stableId: field.stableId
+                      };
+                      // Also set the lastName property directly
+                      cleanedData['lastName'] = fieldValue;
+                    } else {
+                      // For other fields, use the determined mapping type
+                      (cleanedData['__mappedFields'] as any)[mappingType] = {
+                        fieldId,
+                        value: fieldValue,
+                        label: field.label,
+                        stableId: field.stableId
+                      };
+                    }
+                    
+                    // For common fields, also add direct properties
+                    if (mapping.type === 'name') {
+                      cleanedData['name'] = fieldValue;
+                      // Also extract firstName if this is a full name
+                      if (typeof fieldValue === 'string' && fieldValue.includes(' ')) {
+                        const nameParts = fieldValue.split(' ');
+                        cleanedData['firstName'] = nameParts[0];
+                        // If there are multiple parts, the rest is the last name
+                        if (nameParts.length > 1) {
+                          cleanedData['lastName'] = nameParts.slice(1).join(' ');
+                        }
+                      }
+                    } else if (mapping.type === 'firstName') {
+                      cleanedData['firstName'] = fieldValue;
+                      // Update the name field if we have both first and last name
+                      if (cleanedData['__mappedFields']?.lastName?.value) {
+                        cleanedData['name'] = `${fieldValue} ${cleanedData['__mappedFields'].lastName.value}`;
+                      } else {
+                        // If we only have first name, use it as the name
+                        cleanedData['name'] = fieldValue;
+                      }
+                    } else if (mapping.type === 'lastName') {
+                      cleanedData['lastName'] = fieldValue;
+                      // Update the name field if we have both first and last name
+                      if (cleanedData['__mappedFields']?.firstName?.value) {
+                        cleanedData['name'] = `${cleanedData['__mappedFields'].firstName.value} ${fieldValue}`;
+                      } else if (!cleanedData['name']) {
+                        // If we only have last name and no name yet, use it as the name
+                        cleanedData['name'] = fieldValue;
+                      }
+                    } else if (mapping.type === 'email') {
+                      cleanedData['email'] = fieldValue;
+                    } else if (mapping.type === 'phone') {
+                      cleanedData['phone'] = fieldValue;
+                    }
+                    
+                    // Also add any custom mapped fields
+                    if (mapping.type === 'custom' && mapping.customKey) {
+                      cleanedData[mapping.customKey] = fieldValue;
+                    }
+                  }
+                }
+              } catch (e) {
+                console.error(`Error parsing field mapping for ${field.label}:`, e);
+              }
+            }
+          });
+        });
+      } catch (e) {
+        console.error('Error processing section metadata for mappings:', e);
+      }
+    }
+    
+    // Final check to ensure name field is correctly populated with full name when both first and last name are available
+    const mappedFields = cleanedData['__mappedFields'] as any;
+    if (mappedFields) {
+      const firstName = mappedFields.firstName?.value || cleanedData['firstName'] || '';
+      const lastName = mappedFields.lastName?.value || cleanedData['lastName'] || '';
+      
+      // If we have both first and last name, make sure the name field is properly combined
+      if (firstName && lastName) {
+        const fullName = `${firstName} ${lastName}`;
+        console.log(`[SUBMISSION] Updating name from "${cleanedData['name'] || ''}" to "${fullName}" based on firstName and lastName fields`);
+        cleanedData['name'] = fullName;
+      }
+    }
+    
+    console.log(`[SUBMISSION] Mapped fields:`, cleanedData['__mappedFields']);
+    console.log(`[SUBMISSION] Direct access fields: name=${cleanedData['name']}, email=${cleanedData['email']}, phone=${cleanedData['phone']}`);
+    
+    return cleanedData;
+  }
+
+  /**
+   * Get all submissions for a form
+   */
+  async getSubmissionsByFormId(formId: string): Promise<any[]> {
+    const submissions = await prisma.formSubmission.findMany({
+      where: {
+        formId,
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+    
+    // Parse the JSON data for each submission
+    return submissions.map(submission => ({
+      ...submission,
+      data: JSON.parse(submission.data as string),
+    }));
+  }
+
+  /**
+   * Get a submission by ID
+   */
+  async getSubmissionById(id: string): Promise<any | null> {
+    const submission = await prisma.formSubmission.findUnique({
+      where: {
+        id,
+      },
+    });
+    
+    if (!submission) {
+      return null;
+    }
+    
+    // Parse the JSON data
+    return {
+      ...submission,
+      data: JSON.parse(submission.data as string),
+    };
+  }
+
+  /**
+   * Update a submission
+   */
+  async updateSubmission(id: string, data: Partial<any>): Promise<any> {
+    // Extract data that needs to be stringified
+    const { data: submissionData, ...rest } = data;
+    
+    const updateData: any = {
+      ...rest,
+    };
+    
+    // Stringify JSON fields if provided
+    if (submissionData) {
+      updateData.data = JSON.stringify(submissionData);
+    }
+    
+    const submission = await prisma.formSubmission.update({
+      where: {
+        id,
+      },
+      data: updateData,
+    });
+    
+    // Parse the data field which we know exists
+    const result = {
+      ...submission,
+      data: JSON.parse(submission.data as string),
+    };
+    
+    // Only add metadata if it exists on the submission object
+    if ('metadata' in submission && submission.metadata) {
+      Object.assign(result, {
+        metadata: JSON.parse(submission.metadata as string)
+      });
+    }
+    
+    return result;
+  }
+
+  /**
+   * Delete a submission
+   */
+  async deleteSubmission(id: string): Promise<any> {
+    return prisma.formSubmission.delete({
+      where: {
+        id,
+      },
+    });
+  }
+
+  /**
+   * Process form submission data for leads/bookings
+   */
+  async processSubmissionData(formId: string, submissionData: FormSubmissionData): Promise<Record<string, any>> {
+    // Get the form with its fields to determine mappings
+    // Use a type assertion to handle the form structure
+    const form = await prisma.form.findUnique({
+      where: { id: formId },
+      include: {
+        formSections: {
+          include: {
+            fields: true,
+          },
+        },
+      },
+    });
+    
+    if (!form) {
+      throw new Error(`Form with ID ${formId} not found`);
+    }
+    
+    // Initialize processed data
+    const processedData: Record<string, any> = {
+      formId,
+      rawData: submissionData,
+    };
+    
+    // Check if we have the new __mappedFields structure in the submission data
+    if (submissionData.__mappedFields && typeof submissionData.__mappedFields === 'object') {
+      console.log(`Found __mappedFields in submission data:`, submissionData.__mappedFields);
+      
+      // Extract mapped fields directly from the __mappedFields object
+      const mappedFields = submissionData.__mappedFields as Record<string, any>;
+      
+      // Check for name fields - but don't set it yet, we'll prioritize firstName + lastName combination later
+      if (mappedFields.name && mappedFields.name.value) {
+        processedData._rawNameField = mappedFields.name.value;
+        console.log(`Stored raw name from __mappedFields: ${processedData._rawNameField}`);
+      }
+      
+      // Check for first name and last name fields
+      if (mappedFields.firstName && mappedFields.firstName.value) {
+        processedData.firstName = mappedFields.firstName.value;
+        console.log(`Extracted firstName from __mappedFields: ${processedData.firstName}`);
+      }
+      
+      if (mappedFields.lastName && mappedFields.lastName.value) {
+        processedData.lastName = mappedFields.lastName.value;
+        console.log(`Extracted lastName from __mappedFields: ${processedData.lastName}`);
+      }
+      
+      // Check for email field
+      if (mappedFields.email && mappedFields.email.value) {
+        processedData.email = mappedFields.email.value;
+        console.log(`Extracted email from __mappedFields: ${processedData.email}`);
+      }
+      
+      // Check for phone field
+      if (mappedFields.phone && mappedFields.phone.value) {
+        processedData.phone = mappedFields.phone.value;
+        console.log(`Extracted phone from __mappedFields: ${processedData.phone}`);
+      }
+    }
+    
+    // Process fields based on their mappings
+    if (form.formSections) {
+      for (const section of form.formSections) {
+        for (const field of section.fields) {
+          try {
+            // Get the field mapping if it exists
+            const mapping = field.mapping ? JSON.parse(field.mapping as string) : null;
+            
+            // Get the field value from submissionData using field.stableId
+            // since that's what's used in the form submission
+            const fieldValue = submissionData[field.stableId];
+            
+            if (mapping && fieldValue !== undefined) {
+              console.log(`Processing field mapping: ${field.label} (${field.stableId}) = ${fieldValue}`);
+              
+              if (mapping.type === 'email') {
+                processedData.email = fieldValue;
+              } else if (mapping.type === 'name') {
+                // Store the raw name field, but don't set it as the final name yet
+                // We'll prioritize firstName + lastName combination later
+                processedData._rawNameField = fieldValue;
+                console.log(`[PROCESS SUBMISSION] Stored raw name field: ${fieldValue}`);
+              } else if (mapping.type === 'firstName') {
+                processedData.firstName = fieldValue;
+                // Store the first name, we'll combine with last name later if available
+              } else if (mapping.type === 'lastName') {
+                processedData.lastName = fieldValue;
+                // Store the last name, we'll combine with first name later if available
+              } else if (mapping.type === 'phone') {
+                processedData.phone = fieldValue;
+              } else if (mapping.type === 'custom' && mapping.customKey) {
+                processedData[mapping.customKey] = fieldValue;
+              } else {
+                // Default mapping by field type
+                processedData[mapping.type] = fieldValue;
+              }
+            }
+          } catch (error) {
+            console.error(`Error processing field mapping for ${field.label}:`, error);
+          }
+        }
+      }
+    }
+    // Set the name field based on available data, prioritizing firstName + lastName combination
+    if (processedData.firstName && processedData.lastName) {
+      // If we have both first name and last name, always use them combined
+      const fullName = `${processedData.firstName} ${processedData.lastName}`;
+      if (processedData.name && processedData.name !== fullName) {
+        console.log(`[SUBMISSION] Updating name from "${processedData.name}" to "${fullName}" based on firstName and lastName fields`);
+      } else {
+        console.log(`[SUBMISSION] Setting name to "${fullName}" from firstName and lastName fields`);
+      }
+      processedData.name = fullName;
+    } else if (processedData.firstName) {
+      // If we only have first name, use it as name
+      processedData.name = processedData.firstName;
+      console.log(`[SUBMISSION] Setting name to firstName: "${processedData.name}"`);
+    } else if (processedData.lastName) {
+      // If we only have last name, use it as name
+      processedData.name = processedData.lastName;
+      console.log(`[SUBMISSION] Setting name to lastName: "${processedData.name}"`);
+    } else if (processedData._rawNameField) {
+      // If we don't have firstName or lastName, fall back to the raw name field
+      processedData.name = processedData._rawNameField;
+      console.log(`[SUBMISSION] Falling back to raw name field: "${processedData.name}"`);
+    }
+    
+    // Clean up temporary fields
+    delete processedData._rawNameField;
+    
+    // Log the raw submission data for debugging
+    console.log(`[DEBUG] Raw submission data keys:`, Object.keys(submissionData));
+    if (submissionData.__mappedFields) {
+      console.log(`[DEBUG] __mappedFields keys:`, Object.keys(submissionData.__mappedFields));
+    }
+    
+    // Log the final processed data
+    console.log(`[DEBUG] FINAL Processed submission data:`, {
+      name: processedData.name,
+      firstName: processedData.firstName,
+      lastName: processedData.lastName,
+      email: processedData.email,
+      phone: processedData.phone
+    });
+    
+    return processedData;
+  }
+}

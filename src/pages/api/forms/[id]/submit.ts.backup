@@ -1,0 +1,577 @@
+import { NextApiRequest, NextApiResponse } from 'next';
+import prisma from '@/lib/prisma';
+import { sendEmail } from '@/util/email-sender';
+import { replaceVariables } from '@/util/email-template-helpers';
+import { withCors } from '@/util/cors';
+import { mapFieldIds } from '@/util/field-id-mapper';
+import { addApiLog } from '@/pages/api/debug/logs';
+import path from 'path';
+
+// Helper functions for email rules
+function getRecipientType(rule: any): string | null {
+  return rule.recipientType || null;
+}
+
+function getRecipientEmail(rule: any): string | null {
+  return rule.recipientEmail || null;
+}
+
+function getRecipientField(rule: any): string | null {
+  return rule.recipientField || null;
+}
+
+function getCcEmails(rule: any): string | string[] | undefined {
+  const template = rule.template || {};
+  return template.ccEmails || rule.ccEmails || undefined;
+}
+
+function getBccEmails(rule: any): string | string[] | undefined {
+  const template = rule.template || {};
+  return template.bccEmails || rule.bccEmails || undefined;
+}
+
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+  // Standard logging header
+  const fileName = path.basename(__filename);
+  const filePath = __filename;
+  const fileVersion = '1.0';
+  const apiSource = req.headers['referer'] || 'Unknown';
+  
+  console.log(`[FILE NAME] ${fileName}`);
+  console.log(`[FILE PATH] ${filePath}`);
+  console.log(`[${fileVersion} FILE]`);
+  console.log(`[API RECEIVED FROM] ${apiSource}`);
+  console.log(`[PROCESSING] Form submission handler starting`);
+  
+  if (req.method !== 'POST') {
+    console.log(`[ERROR] Method not allowed: ${req.method}`);
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  // console.log("DEBUG - Environment:", process.env.NODE_ENV);
+  // console.log("DEBUG - Email settings:", { 
+  //   SENDGRID_API_KEY: !!process.env.SENDGRID_API_KEY,
+  //   SENDGRID_FROM_EMAIL: process.env.SENDGRID_FROM_EMAIL
+  // });
+
+  try {
+    const { id } = req.query;
+    const formData = req.body;
+    
+    console.log(`[PROCESSING] Handling form submission for form ID: ${id}`);
+    console.log(`[FORM DATA] Keys received: ${Object.keys(formData).join(', ')}`);
+    console.log(`[FORM DATA] Email field value: ${formData.email || 'Not provided'}`);
+    console.log(`[FORM DATA] Name field value: ${formData.name || 'Not provided'}`);
+    
+
+    // console.log('Received form data:', formData);
+
+    console.log(`[DATABASE] Fetching form with ID: ${id}`);
+    const form = await prisma.form.findFirst({
+      where: {
+        id: String(id),
+        isActive: true,
+      },
+      include: {
+        formSections: {
+          include: {
+            fields: true
+          }
+        }
+      }
+    });
+    
+    console.log(`[DATABASE] Form found: ${!!form}`);
+    if (form) {
+      console.log(`[FORM INFO] Name: ${form.name}`);
+      console.log(`[FORM INFO] Type: ${form.type}`);
+      console.log(`[FORM INFO] Sections count: ${form.formSections?.length || 0}`);
+    }
+
+    if (!form) {
+      return res.status(404).json({ error: 'Form not found or inactive' });
+    }
+
+    const trackingToken = req.body._trackingToken || null;
+    let sourceLeadId = null;
+    
+    if (trackingToken) {
+      try {
+        const { extractLeadIdFromToken } = require('@/util/tracking-links');
+        sourceLeadId = extractLeadIdFromToken(trackingToken);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`Extracted source lead ID from tracking token: ${sourceLeadId}`);
+        }
+      } catch (error) {
+        console.error('Error extracting lead ID from tracking token:', error);
+      }
+    }
+    
+    const timestamp = new Date().getTime();
+    const timestampStr = timestamp.toString();
+    
+    // console.log('DEBUG - Generating tracking token with timestamp:', timestampStr);
+    
+    let generatedTrackingToken = req.body._trackingToken;
+    
+    if (!generatedTrackingToken) {
+      const tokenBase = sourceLeadId || form.id;
+      generatedTrackingToken = `${tokenBase}-${timestampStr}`;
+      // console.log(`DEBUG - Generated new tracking token using ${sourceLeadId ? 'sourceLeadId' : 'formId'} as base:`, generatedTrackingToken);
+      
+      if (!generatedTrackingToken) {
+        generatedTrackingToken = `form-${form.id}-${timestampStr}`;
+        // console.log(`DEBUG - Fallback tracking token generation:`, generatedTrackingToken);
+      }
+    } else {
+      // console.log('DEBUG - Using existing tracking token:', generatedTrackingToken);
+    }
+    
+    const result = await prisma.$transaction(async (tx) => {
+      console.log(`[DATABASE] Creating form submission record`);
+      const submission = await tx.formSubmission.create({
+        data: {
+          formId: form.id,
+          data: formData,
+          trackingToken: generatedTrackingToken,
+          sourceLeadId: sourceLeadId,
+          timeStamp: timestampStr,
+        },
+      });
+      
+      console.log(`[DATABASE] Form submission created with ID: ${submission.id}`);
+      console.log(`[TRACKING] Token: ${generatedTrackingToken}`);
+      console.log(`[TRACKING] Source Lead ID: ${sourceLeadId || 'None'}`);
+      console.log(`[TRACKING] Timestamp: ${timestampStr}`);
+      
+
+      // console.log('DEBUG - Created form submission with tracking data:', {
+      //   id: submission.id,
+      //   trackingToken: submission.trackingToken,
+      //   sourceLeadId: submission.sourceLeadId,
+      //   timeStamp: timestampStr
+      // });
+      
+      const verifySubmission = await tx.formSubmission.findUnique({
+        where: { id: submission.id },
+        select: { trackingToken: true, timeStamp: true }
+      });
+      
+      // console.log('DEBUG - Verification of saved tracking data:', {
+      //   trackingTokenSaved: verifySubmission?.trackingToken === generatedTrackingToken,
+      //   trackingToken: verifySubmission?.trackingToken,
+      //   timeStampSaved: verifySubmission?.timeStamp === timestampStr,
+      //   timeStamp: verifySubmission?.timeStamp
+      // });
+
+      const mappedData: Record<string, string | null> = {
+        email: null,
+        name: null,
+        phone: null,
+        date: null,
+        time: null,
+        location: null,
+        location_office: null,
+        datetime: null,
+      };
+
+      const processFields = (fields: any[]) => {
+        fields.forEach((field) => {
+          if (field.mapping && formData[field.id] !== undefined) {
+            // console.log(`Mapping field ${field.id} with value ${formData[field.id]} to ${field.mapping}`);
+            mappedData[field.mapping] = formData[field.id];
+          }
+        });
+      };
+
+      if (form.formSections && form.formSections.length > 0) {
+        // console.log('Processing form sections:', form.formSections);
+        form.formSections.forEach(section => {
+          if (section.fields && section.fields.length > 0) {
+            processFields(section.fields);
+          }
+        });
+      } else if (form.sections) {
+        // console.log('Using legacy sections');
+        const sections = form.sections as any[];
+        sections.forEach(section => {
+          if (Array.isArray(section.fields)) {
+            processFields(section.fields);
+          }
+        });
+      } else if (Array.isArray(form.fields)) {
+        // console.log('Using legacy fields');
+        processFields(form.fields);
+      }
+
+      // console.log('Mapped data:', mappedData);
+
+      if (form.type === 'INQUIRY') {
+        // console.log('Creating lead with data:', mappedData);
+        const lead = await tx.lead.create({
+          data: {
+            email: mappedData.email,
+            name: mappedData.name,
+            phone: mappedData.phone,
+            source: 'public_form',
+            formId: form.id,
+          },
+        });
+
+        await tx.formSubmission.update({
+          where: { id: submission.id },
+          data: { leadId: lead.id },
+        });
+
+        return { type: 'lead', data: lead, submission };
+      } else {
+        // console.log('Creating booking with data:', mappedData);
+        
+        if (!mappedData.email) {
+          throw new Error('Email is required for bookings');
+        }
+        if (!mappedData.name) {
+          throw new Error('Name is required for bookings');
+        }
+        
+        // Set a flag to indicate this is a public form submission
+        const { setPublicContext } = require('@/util/public-context');
+        setPublicContext(req);
+        
+        let bookingDate: Date;
+        let bookingTime: string | null = null;
+        
+        if (mappedData.datetime) {
+          try {
+            const dateTimeObj = new Date(mappedData.datetime);
+            bookingDate = dateTimeObj;
+            const hours = dateTimeObj.getHours();
+            const minutes = dateTimeObj.getMinutes();
+            const ampm = hours >= 12 ? 'PM' : 'AM';
+            const formattedHours = hours % 12 || 12;
+            const formattedMinutes = minutes < 10 ? `0${minutes}` : minutes;
+            bookingTime = `${formattedHours}:${formattedMinutes} ${ampm}`;
+          } catch (error) {
+            console.error('Error parsing datetime:', error);
+            throw new Error('Invalid date and time format');
+          }
+        } else {
+          if (!mappedData.date) {
+            throw new Error('Date is required for bookings');
+          }
+          bookingDate = mappedData.date ? new Date(mappedData.date) : new Date();
+          bookingTime = mappedData.time;
+        }
+
+        const bookingLocation = mappedData.location || mappedData.location_office || null;
+
+        const booking = await tx.booking.create({
+          data: {
+            email: mappedData.email,
+            name: mappedData.name,
+            phone: mappedData.phone,
+            date: bookingDate,
+            time: bookingTime,
+            location: bookingLocation,
+            formId: form.id,
+          },
+        });
+
+        await tx.formSubmission.update({
+          where: { id: submission.id },
+          data: { bookingId: booking.id },
+        });
+
+        return { type: 'booking', data: booking, submission };
+      }
+    });
+
+    let emailRuleResults = null;
+    try {
+      // console.log('Processing email rules for form submission...');
+      
+      // Apply field ID mapping to make email rules more robust
+      const mappedFormData = await mapFieldIds(form.id, formData);
+      addApiLog(`Applied field ID mapping to form data`, 'info', 'forms');
+      
+      // Define emailRuleData with proper type
+      const emailRuleData: Record<string, any> = {
+        ...mappedFormData, // Use the mapped form data instead of the original
+        id: result.submission.id,
+        formId: form.id,
+        userId: form.userId,
+        submissionId: result.submission.id,
+        trackingToken: result.submission.trackingToken,
+        timeStamp: timestampStr,
+      };
+      
+      // console.log('DEBUG - Email rule data with tracking information:', {
+      //   submissionId: result.submission.id,
+      //   trackingToken: result.submission.trackingToken,
+      //   sourceLeadId: result.submission.sourceLeadId,
+      //   timeStamp: emailRuleData.timeStamp
+      // });
+      
+      if (result.type === 'booking' && result.data) {
+        emailRuleData.email = result.data.email || emailRuleData.email;
+        emailRuleData.name = result.data.name || emailRuleData.name;
+        emailRuleData.phone = result.data.phone || emailRuleData.phone;
+        emailRuleData.bookingId = result.data.id;
+        if (process.env.NODE_ENV !== 'production') {
+          console.log(`Booking created with ID: ${result.data.id}, adding to email data`);
+        }
+      }
+      
+      console.log(`[API TO TRIGGER NEXT STEP] Processing email rules internally (synchronous)`);
+      console.log(`[EMAIL RULES] Starting email rule processing for submission ID: ${result.submission.id}`);
+      
+      // Find active email rules for this form
+      console.log(`[DATABASE] Fetching active email rules for form ID: ${form.id}`);
+      const emailRules = await prisma.emailRule.findMany({
+        where: {
+          formId: form.id,
+          active: true,
+        },
+        include: {
+          template: true,
+        },
+      });
+
+      console.log(`[EMAIL RULES] Found ${emailRules.length} active email rules`);
+      emailRules.forEach((rule, index) => {
+        console.log(`[EMAIL RULE ${index + 1}] ID: ${rule.id}, Name: ${rule.name}`);
+        console.log(`[EMAIL RULE ${index + 1}] Template ID: ${rule.templateId}`);
+        console.log(`[EMAIL RULE ${index + 1}] Has template object: ${!!rule.template}`);
+        if (rule.template) {
+          console.log(`[EMAIL RULE ${index + 1}] Template name: ${rule.template.name}`);
+          console.log(`[EMAIL RULE ${index + 1}] Template CC emails: ${rule.template.ccEmails || 'None'}`);
+          console.log(`[EMAIL RULE ${index + 1}] Template BCC emails: ${rule.template.bccEmails || 'None'}`);
+        }
+      });
+      
+      const results = [];
+      
+      for (const rule of emailRules) {
+        try {
+          let conditions;
+          try {
+            const parsedConditions = typeof rule.conditions === 'string' 
+              ? JSON.parse(rule.conditions) 
+              : rule.conditions;
+            conditions = parsedConditions;
+            console.log(`[EMAIL RULE ${rule.id}] Processing rule with conditions:`, JSON.stringify(conditions));
+          } catch (parseError) {
+            console.error(`[EMAIL RULE ${rule.id}] Error parsing conditions:`, parseError);
+            conditions = [];
+          }
+          
+          let matches = false;
+          let conditionResults = [];
+          
+          if (!conditions || !Array.isArray(conditions) || conditions.length === 0) {
+            console.log(`[EMAIL RULE ${rule.id}] No conditions, considering it a match`);
+            matches = true;
+            conditionResults = [{ description: 'No conditions defined', result: true }];
+          } else {
+            // Use our new field mapping system to evaluate conditions
+            const { evaluateConditions } = await import('@/util/email-rules');
+            
+            try {
+              // Pass the formId to enable field mapping
+              const evaluationResult = await evaluateConditions(conditions, emailRuleData, {
+                logging: true,
+                logFn: (message, level) => {
+                  addApiLog(message, level === 'error' ? 'error' : 'info', 'emails');
+                  if (level === 'error') {
+                    console.error(`[EMAIL RULE ${rule.id}] ${message}`);
+                  } else {
+                    console.log(`[EMAIL RULE ${rule.id}] ${message}`);
+                  }
+                },
+                ruleId: rule.id,
+                formId: form.id
+              });
+              
+              matches = evaluationResult.matches;
+              
+              // Convert the evaluation details to the format expected by the rest of the code
+              conditionResults = evaluationResult.details?.map(detail => ({
+                description: `${detail.field} ${detail.operator} ${detail.expectedValue}`,
+                result: detail.result,
+                details: {
+                  field: detail.field,
+                  operator: detail.operator,
+                  expectedValue: detail.expectedValue,
+                  actualValue: detail.actualValue,
+                  passed: detail.result,
+                  reason: detail.reason
+                }
+              })) || [];
+              
+              console.log(`[EMAIL RULE ${rule.id}] Evaluation result: ${matches ? 'MATCHED' : 'NOT MATCHED'}`);
+              addApiLog(`Rule ${rule.id} evaluation result: ${matches ? 'MATCHED' : 'NOT MATCHED'}`, 
+                matches ? 'success' : 'info', 'emails');
+            } catch (evalError) {
+              console.error(`[EMAIL RULE ${rule.id}] Error evaluating conditions:`, evalError);
+              addApiLog(`Error evaluating conditions for rule ${rule.id}: ${evalError instanceof Error ? evalError.message : 'Unknown error'}`, 
+                'error', 'emails');
+              
+              matches = false;
+              conditionResults = [{
+                description: 'Error evaluating conditions',
+                result: false,
+                details: { error: evalError instanceof Error ? evalError.message : 'Unknown error' }
+              }];
+            }
+          }
+          
+          if (matches) {
+            console.log(`[EMAIL RULE ${rule.id}] Rule matched, preparing to send email`);
+            const completeEmailData = {
+              ...emailRuleData,
+              submission: result.submission,
+              formSubmission: result.submission,
+              formData: formData,
+              ...formData
+            };
+            
+            const htmlContent = replaceVariables(rule.template.htmlContent, completeEmailData);
+            const subject = replaceVariables(rule.template.subject, completeEmailData);
+            
+            let recipientEmail = '';
+
+            const recipientTypeRaw = getRecipientType(rule);
+            const recipientTypeLower = recipientTypeRaw ? recipientTypeRaw.toLowerCase() : '';
+            
+            if (recipientTypeLower === 'custom' || recipientTypeLower === 'static') {
+              recipientEmail = getRecipientEmail(rule) || '';
+              console.log(`[EMAIL RULE ${rule.id}] Using custom recipient email from rule: ${recipientEmail}`);
+            } else if (recipientTypeLower === 'field') {
+              const fieldName = getRecipientField(rule) || '';
+              recipientEmail = emailRuleData[fieldName] || '';
+              console.log(`[EMAIL RULE ${rule.id}] Using email from form field ${fieldName}: ${recipientEmail}`);
+            } else {
+              console.log(`[EMAIL RULE ${rule.id}] Using form submitter email or looking for default email field`);
+              
+              const formFields = form.formSections?.flatMap(section => section.fields) || [];
+              const emailField = formFields.find(field => 
+                field.type === 'email' || 
+                field.mapping === 'email'
+              );
+
+              recipientEmail = emailField 
+                ? (emailRuleData[emailField.id] as string || '')
+                : (Object.entries(emailRuleData).find(([key, value]) => 
+                    key === 'email' || 
+                    key.toLowerCase().includes('email')
+                  )?.[1] as string || '');
+            }
+            
+            const ccEmails = getCcEmails(rule);
+            const bccEmails = getBccEmails(rule);
+            
+            console.log(`[EMAIL RULE ${rule.id}] CC emails: ${ccEmails ? (Array.isArray(ccEmails) ? ccEmails.join(', ') : ccEmails) : 'None'}`);
+            console.log(`[EMAIL RULE ${rule.id}] BCC emails: ${bccEmails ? (Array.isArray(bccEmails) ? bccEmails.join(', ') : bccEmails) : 'None'}`);
+            console.log(`[EMAIL RULE ${rule.id}] Recipient: ${recipientEmail}`);
+            console.log(`[EMAIL RULE ${rule.id}] Subject: ${subject}`);
+            
+            if (!recipientEmail) {
+              console.error(`[EMAIL RULE ${rule.id}] No recipient email found in form data`);
+              results.push({
+                ruleId: rule.id,
+                success: false,
+                error: 'No recipient email found in form data',
+              });
+              continue;
+            }
+            
+            try {
+              console.log(`[EMAIL SENDING] Calling sendEmail utility`);
+              console.log(`[API TO TRIGGER NEXT STEP] /util/email-sender.ts`);
+              const emailResult = await sendEmail({
+                to: recipientEmail,
+                subject,
+                html: htmlContent,
+                cc: ccEmails,
+                bcc: bccEmails,
+                userId: form.userId || 'system', // Required by the sendEmail interface
+                formSubmissionId: result.submission.id,
+                templateId: rule.templateId, // Changed from emailTemplateId to match interface
+              });
+              
+              if (emailResult.success) {
+                console.log(`[EMAIL SENDING] Success: Email sent to ${recipientEmail}`);
+                console.log(`[EMAIL SENDING] Email log ID: ${emailResult.emailLogId}`);
+                results.push({
+                  ruleId: rule.id,
+                  success: true,
+                  emailLogId: emailResult.emailLogId,
+                });
+              } else {
+                console.error(`[EMAIL SENDING] Error sending email for rule ${rule.id}:`, emailResult.error);
+                results.push({
+                  ruleId: rule.id,
+                  success: false,
+                  error: emailResult.error,
+                });
+              }
+            } catch (sendError) {
+              console.error(`[EMAIL SENDING] Error sending email for rule ${rule.id}:`, sendError);
+              results.push({
+                ruleId: rule.id,
+                success: false,
+                error: sendError instanceof Error ? sendError.message : 'Unknown error',
+              });
+            }
+          } else {
+            results.push({
+              ruleId: rule.id,
+              success: false,
+              error: 'Conditions not met',
+            });
+          }
+        } catch (error) {
+          console.error(`[EMAIL RULES] Error processing rule ${rule.id}:`, error);
+          results.push({
+            ruleId: rule.id,
+            success: false,
+            error: error instanceof Error ? error.message : 'Unknown error',
+          });
+        }
+      }
+      
+      emailRuleResults = { results };
+      console.log(`[EMAIL RULES] Completed processing ${results.length} email rules`);
+      console.log(`[EMAIL RULES] ${results.filter(r => r.success).length} emails sent successfully`);
+    } catch (emailError) {
+      console.error('[EMAIL RULES] Error processing email rules:', emailError);
+      console.error('[EMAIL RULES] Email error details:', JSON.stringify(emailError));
+    }
+    
+    console.log(`[RESPONSE] Sending successful response with submission ID: ${result.submission.id}`);
+    console.log(`[COMPLETE] Form submission processing completed successfully`);
+    return res.status(200).json({
+      message: 'Form submitted successfully',
+      submissionId: result.submission.id,
+      type: result.type,
+      [result.type]: result.data,
+      emailResults: emailRuleResults
+    });
+  } catch (error) {
+    console.error('[ERROR] Form submission error:', error);
+    
+    if (error instanceof Error) {
+      if (error.message.includes('required')) {
+        return res.status(400).json({ error: error.message });
+      }
+    }
+    
+    return res.status(500).json({ error: 'Failed to submit form' });
+  }
+}
+
+// Export the handler with CORS middleware
+export default withCors(handler, {
+  allowedMethods: ['POST', 'OPTIONS'],
+  maxAge: 86400, // 24 hours
+});

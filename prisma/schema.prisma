@@ -1,0 +1,773 @@
+generator client {
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "rhel-openssl-3.0.x"]
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model User {
+  id              String           @id @db.Uuid
+  email           String           @unique
+  role            UserRole         @default(MARRIAGE_OFFICER)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  bookings        Booking[]
+  emailLogs       EmailLog[]
+  emailRules      EmailRule[]
+  emailTemplates  EmailTemplate[]
+  forms           Form[]
+  invoices        Invoice[]
+  leads           Lead[]
+  marriageOfficer MarriageOfficer?
+}
+
+model Form {
+  id           String           @id @default(cuid())
+  name         String
+  description  String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  isActive     Boolean          @default(true)
+  userId       String           @db.Uuid
+  type         FormType         @default(INQUIRY)
+  fields       Json?
+  isMultiPage  Boolean          @default(false)
+  sections     Json?
+  bookings     Booking[]
+  emailRules   EmailRule[]
+  createdBy    User             @relation(fields: [userId], references: [id])
+  formSections FormSection[]
+  formSessions FormSession[]
+  styles       FormStyle[]
+  submissions  FormSubmission[]
+  leads        Lead[]
+}
+
+model FormSection {
+  id          String      @id @default(cuid())
+  formId      String
+  title       String
+  description String?
+  order       Int
+  isPage      Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  fields      FormField[]
+  form        Form        @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId])
+}
+
+model FormField {
+  id               String      @id @default(cuid())
+  sectionId        String
+  type             String
+  label            String
+  placeholder      String?
+  helpText         String?
+  required         Boolean     @default(false)
+  options          Json?
+  validation       Json?
+  order            Int
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  excludeTime      Boolean     @default(false)
+  mapping          String?
+  conditionalLogic Json?
+  stableId         String      @unique @default(dbgenerated("(gen_random_uuid())::text"))
+  inUseByRules     Boolean     @default(false)
+  section          FormSection @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  @@index([sectionId])
+  @@index([stableId])
+}
+
+model FormSubmission {
+  id              String                @id @default(cuid())
+  formId          String
+  data            Json
+  createdAt       DateTime              @default(now())
+  leadId          String?
+  bookingId       String?
+  sourceLeadId    String?
+  trackingToken   String?
+  timeStamp       String?
+  emailLogs       EmailLog[]
+  ruleEvaluations EmailRuleEvaluation[]
+  booking         Booking?              @relation(fields: [bookingId], references: [id])
+  form            Form                  @relation(fields: [formId], references: [id])
+  lead            Lead?                 @relation(fields: [leadId], references: [id])
+
+  @@index([trackingToken])
+  @@index([sourceLeadId])
+  @@index([timeStamp])
+}
+
+model Lead {
+  id             String           @id @default(cuid())
+  email          String?
+  phone          String?
+  name           String?
+  status         String           @default("NEW")
+  source         String?
+  notes          String?
+  assignedUserId String?          @db.Uuid
+  formId         String
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+  submissions    FormSubmission[]
+  assignedTo     User?            @relation(fields: [assignedUserId], references: [id])
+  form           Form             @relation(fields: [formId], references: [id])
+}
+
+model Booking {
+  id                      String           @id @default(cuid())
+  date                    DateTime
+  time                    String?
+  location                String?
+  status                  BookingStatus    @default(PENDING)
+  email                   String
+  phone                   String?
+  name                    String
+  notes                   String?
+  assignedUserId          String?          @db.Uuid
+  formId                  String
+  createdAt               DateTime         @default(now())
+  updatedAt               DateTime         @updatedAt
+  confirmationEmailSent   Boolean          @default(false)
+  confirmationEmailSentAt DateTime?
+  assignedTo              User?            @relation(fields: [assignedUserId], references: [id])
+  form                    Form             @relation(fields: [formId], references: [id])
+  emailLogs               EmailLog[]
+  submissions             FormSubmission[]
+  invoices                Invoice[]
+}
+
+model Invoice {
+  id                   String            @id @default(cuid())
+  bookingId            String
+  status               String            @default("pending")
+  createdAt            DateTime          @default(now())
+  updatedAt            DateTime          @updatedAt
+  serviceRate          Float             @default(0)
+  serviceType          String            @default("REGISTRATION_OFFICE")
+  totalAmount          Float             @default(0)
+  travelCosts          Float             @default(0)
+  officerId            String?
+  dueDate              DateTime?
+  emailSent            Boolean           @default(false)
+  emailSentAt          DateTime?
+  invoiceNumber        String?
+  userId               String?           @db.Uuid
+  amountPaid           Decimal?          @db.Decimal(10, 2)
+  paymentDate          DateTime?
+  paymentMethod        String?
+  originalInvoiceId    String?
+  replacementInvoiceId String?
+  voidComment          String?
+  voidReason           String?
+  voidedAt             DateTime?
+  balanceDue           Decimal?          @db.Decimal(10, 2)
+  emailLogs            EmailLog[]
+  booking              Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  officer              MarriageOfficer?  @relation(fields: [officerId], references: [id])
+  replacementInvoice   Invoice?          @relation("ReplacementInvoice", fields: [replacementInvoiceId], references: [id])
+  originalInvoices     Invoice[]         @relation("ReplacementInvoice")
+  user                 User?             @relation(fields: [userId], references: [id])
+  lineItems            InvoiceLineItem[]
+  payments             InvoicePayment[]
+
+  @@index([bookingId])
+  @@index([replacementInvoiceId])
+}
+
+model InvoiceLineItem {
+  id          String           @id @default(cuid())
+  invoiceId   String
+  description String
+  quantity    Decimal          @default(1) @db.Decimal(10, 2)
+  unitPrice   Decimal          @db.Decimal(10, 2)
+  amount      Decimal          @db.Decimal(10, 2)
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  invoice     Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  payments    InvoicePayment[]
+
+  @@index([invoiceId])
+}
+
+model InvoicePayment {
+  id            String           @id @default(cuid())
+  invoiceId     String
+  amount        Decimal          @db.Decimal(10, 2)
+  paymentMethod String
+  paymentDate   DateTime         @default(now())
+  lineItemId    String?
+  notes         String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  invoice       Invoice          @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  lineItem      InvoiceLineItem? @relation(fields: [lineItemId], references: [id])
+
+  @@index([invoiceId])
+  @@index([lineItemId])
+}
+
+model MarriageOfficer {
+  id          String        @id @default(cuid())
+  userId      String        @unique @db.Uuid
+  title       String?
+  firstName   String
+  lastName    String
+  phoneNumber String?
+  address     String?
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  initials    String?
+  invoices    Invoice[]
+  user        User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rates       ServiceRate[]
+}
+
+model ServiceRate {
+  id              String          @id @default(cuid())
+  officerId       String
+  serviceType     String
+  baseRate        Decimal         @db.Decimal(10, 2)
+  travelRatePerKm Decimal?        @db.Decimal(10, 2)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+  officer         MarriageOfficer @relation(fields: [officerId], references: [id], onDelete: Cascade)
+}
+
+model GenericServiceRate {
+  id              String   @id @default(cuid())
+  serviceType     String
+  baseRate        Decimal  @db.Decimal(10, 2)
+  travelRatePerKm Decimal? @db.Decimal(10, 2)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model ZapierWebhook {
+  id          String   @id @default(cuid())
+  name        String
+  url         String
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  variables   Json?    @default("{}")
+}
+
+model OfficeLocation {
+  id        String   @id @default(cuid())
+  name      String
+  address   String
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PdfTemplate {
+  id          String          @id @default(cuid())
+  name        String
+  description String?
+  type        PdfTemplateType
+  htmlContent String
+  cssContent  String?
+  isActive    Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+}
+
+model EmailTemplate {
+  id          String            @id @default(cuid())
+  name        String
+  subject     String
+  htmlContent String
+  type        EmailTemplateType @default(CUSTOM)
+  description String?
+  userId      String            @db.Uuid
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  folder      String?
+  bccEmails   String?
+  ccEmails    String?
+  emailLogs   EmailLog[]
+  emailRules  EmailRule[]
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([folder])
+}
+
+model EmailRule {
+  id             String                @id @default(cuid())
+  name           String
+  description    String?
+  templateId     String
+  formId         String?
+  active         Boolean               @default(true)
+  userId         String                @db.Uuid
+  createdAt      DateTime              @default(now())
+  updatedAt      DateTime              @updatedAt
+  conditions     Json                  @default("{}")
+  folder         String?
+  bccEmails      String?
+  ccEmails       String?
+  recipientEmail String?
+  recipientField String?
+  recipientType  String?
+  form           Form?                 @relation(fields: [formId], references: [id])
+  template       EmailTemplate         @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user           User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  evaluations    EmailRuleEvaluation[]
+
+  @@index([userId])
+  @@index([templateId])
+  @@index([formId])
+  @@index([folder])
+}
+
+model EmailLog {
+  id               String          @id @default(cuid())
+  templateId       String
+  recipient        String
+  subject          String
+  status           String
+  error            String?
+  userId           String          @db.Uuid
+  bookingId        String?
+  invoiceId        String?
+  formSubmissionId String?
+  createdAt        DateTime        @default(now())
+  bccRecipients    String?
+  ccRecipients     String?
+  booking          Booking?        @relation(fields: [bookingId], references: [id])
+  formSubmission   FormSubmission? @relation(fields: [formSubmissionId], references: [id])
+  invoice          Invoice?        @relation(fields: [invoiceId], references: [id])
+  template         EmailTemplate   @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user             User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([templateId])
+  @@index([bookingId])
+  @@index([invoiceId])
+}
+
+model EmailRuleEvaluation {
+  id               String         @id @default(cuid())
+  ruleId           String
+  formSubmissionId String
+  matched          Boolean
+  conditionResults Json?
+  error            String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+  formSubmission   FormSubmission @relation(fields: [formSubmissionId], references: [id], onDelete: Cascade)
+  rule             EmailRule      @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+
+  @@index([ruleId])
+  @@index([formSubmissionId])
+}
+
+model BackgroundJob {
+  id          String            @id @default(cuid())
+  type        BackgroundJobType
+  status      String            @default("PENDING")
+  resourceId  String
+  error       String?
+  metadata    Json?
+  createdAt   DateTime          @default(now())
+  completedAt DateTime?
+
+  @@index([resourceId])
+}
+
+model SystemSettings {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model DebugLog {
+  id        String   @id @default(cuid())
+  message   String
+  type      String
+  source    String
+  timestamp DateTime @default(now())
+
+  @@index([source])
+  @@index([timestamp])
+}
+
+model FormSession {
+  id            String    @id @default(cuid())
+  formId        String
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  status        String    @default("STARTED")
+  data          Json?
+  ipAddress     String?
+  userAgent     String?
+  trackingToken String?
+  email         String?
+  name          String?
+  phone         String?
+  form          Form      @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId])
+  @@index([status])
+  @@index([email])
+}
+
+model FormStyle {
+  id             String         @id @default(cuid())
+  name           String
+  description    String?
+  cssContent     String
+  isGlobal       Boolean        @default(false)
+  formId         String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  formSystemType FormSystemType @default(BOTH)
+  form           Form?          @relation(fields: [formId], references: [id])
+
+  @@index([formId])
+  @@index([formSystemType])
+}
+
+model Form2 {
+  id               String            @id @default(cuid())
+  title            String
+  description      String?
+  type             String
+  version          String            @default("2.0")
+  isActive         Boolean           @default(true)
+  isPublic         Boolean           @default(false)
+  submitButtonText String?
+  successMessage   String?
+  userId           String
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  legacyFormId     String?
+  emailRules       EmailRule2[]
+  sections         FormSection2[]
+  submissions      FormSubmission2[]
+
+  @@index([userId])
+  @@index([type])
+  @@index([isActive])
+}
+
+model FormSection2 {
+  id               String       @id @default(cuid())
+  title            String
+  description      String?
+  order            Int          @default(0)
+  formId           String
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  conditionalLogic String?
+  fields           FormField2[]
+  form             Form2        @relation(fields: [formId], references: [id], onDelete: Cascade)
+
+  @@index([formId])
+  @@index([order])
+}
+
+model FormField2 {
+  id               String       @id @default(cuid())
+  type             String
+  label            String
+  name             String
+  placeholder      String?
+  helpText         String?
+  required         Boolean      @default(false)
+  order            Int          @default(0)
+  sectionId        String
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  config           String
+  validation       String?
+  conditionalLogic String?
+  mapping          String?
+  stableId         String       @unique
+  inUseByRules     Boolean      @default(false)
+  legacyFieldId    String?
+  section          FormSection2 @relation(fields: [sectionId], references: [id], onDelete: Cascade)
+
+  @@index([sectionId])
+  @@index([order])
+  @@index([type])
+  @@index([stableId])
+}
+
+model FormSubmission2 {
+  id                 String      @id @default(cuid())
+  formId             String
+  data               String
+  metadata           String?
+  status             String      @default("SUBMITTED")
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+  legacySubmissionId String?
+  emailLogs          EmailLog2[]
+  form               Form2       @relation(fields: [formId], references: [id])
+
+  @@index([formId])
+  @@index([createdAt])
+  @@index([status])
+}
+
+model EmailTemplate2 {
+  id               String       @id @default(cuid())
+  name             String
+  description      String?
+  type             String
+  subject          String
+  htmlContent      String
+  textContent      String?
+  userId           String
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+  legacyTemplateId String?
+  emailLogs        EmailLog2[]
+  emailRules       EmailRule2[]
+
+  @@index([userId])
+  @@index([type])
+}
+
+model EmailRule2 {
+  id             String         @id @default(cuid())
+  name           String
+  description    String?
+  formId         String
+  templateId     String
+  isActive       Boolean        @default(true)
+  conditions     String
+  recipientType  String
+  recipientEmail String?
+  recipientField String?
+  ccEmails       String?
+  bccEmails      String?
+  userId         String
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  legacyRuleId   String?
+  emailLogs      EmailLog2[]
+  form           Form2          @relation(fields: [formId], references: [id])
+  template       EmailTemplate2 @relation(fields: [templateId], references: [id])
+
+  @@index([formId])
+  @@index([templateId])
+  @@index([userId])
+  @@index([isActive])
+}
+
+model EmailProcessingLog2 {
+  id            String   @id @default(cuid())
+  level         String
+  message       String
+  correlationId String
+  source        String
+  formId        String?
+  submissionId  String?
+  ruleId        String?
+  templateId    String?
+  timestamp     DateTime
+  details       String?
+  error         String?
+  stackTrace    String?
+  createdAt     DateTime @default(now())
+
+  @@index([correlationId])
+  @@index([submissionId])
+  @@index([formId])
+  @@index([level])
+  @@index([timestamp])
+}
+
+model EmailQueue2 {
+  id            String    @id @default(cuid())
+  templateId    String
+  recipient     String
+  subject       String
+  html          String
+  text          String?
+  cc            String?
+  bcc           String?
+  submissionId  String?
+  formId        String?
+  userId        String?
+  ruleId        String?
+  correlationId String
+  source        String
+  status        String
+  createdAt     DateTime  @default(now())
+  sentAt        DateTime?
+  error         String?
+  metadata      String?
+
+  @@index([status])
+  @@index([correlationId])
+  @@index([createdAt])
+}
+
+model EmailLog2 {
+  id            String           @id @default(cuid())
+  templateId    String
+  submissionId  String?
+  formId        String?
+  ruleId        String?
+  recipient     String
+  subject       String
+  status        String
+  userId        String?
+  ccRecipients  String?
+  bccRecipients String?
+  error         String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  trackingId    String?          @unique
+  openedAt      DateTime?
+  clickedAt     DateTime?
+  deliveredAt   DateTime?
+  rule          EmailRule2?      @relation(fields: [ruleId], references: [id])
+  submission    FormSubmission2? @relation(fields: [submissionId], references: [id])
+  template      EmailTemplate2   @relation(fields: [templateId], references: [id])
+
+  @@index([templateId])
+  @@index([submissionId])
+  @@index([formId])
+  @@index([ruleId])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model AnalyticsEvent2 {
+  id              String   @id
+  type            String
+  timestamp       DateTime
+  sessionId       String
+  userId          String?
+  visitorId       String
+  formId          String?
+  formName        String?
+  formType        String?
+  fieldId         String?
+  fieldName       String?
+  sectionId       String?
+  sectionName     String?
+  submissionId    String?
+  emailId         String?
+  bookingId       String?
+  value           String?
+  metadata        String?
+  source          String?
+  medium          String?
+  campaign        String?
+  referrer        String?
+  userAgent       String?
+  ipAddress       String?
+  duration        Int?
+  previousEventId String?
+  createdAt       DateTime @default(now())
+
+  @@index([sessionId])
+  @@index([visitorId])
+  @@index([formId])
+  @@index([submissionId])
+  @@index([emailId])
+  @@index([type])
+  @@index([timestamp])
+}
+
+model FormAnalyticsSummary2 {
+  id                    String   @id @default(cuid())
+  formId                String
+  date                  DateTime
+  views                 Int      @default(0)
+  starts                Int      @default(0)
+  completions           Int      @default(0)
+  abandonments          Int      @default(0)
+  averageCompletionTime Int?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@unique([formId, date])
+  @@index([formId])
+  @@index([date])
+}
+
+model FieldAnalyticsSummary2 {
+  id             String   @id @default(cuid())
+  formId         String
+  fieldId        String
+  date           DateTime
+  focuses        Int      @default(0)
+  blurs          Int      @default(0)
+  changes        Int      @default(0)
+  errors         Int      @default(0)
+  totalTimeSpent Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([formId, fieldId, date])
+  @@index([formId])
+  @@index([fieldId])
+  @@index([date])
+}
+
+enum UserRole {
+  SUPER_ADMIN
+  ADMIN
+  MARRIAGE_OFFICER
+}
+
+enum FormType {
+  INQUIRY
+  BOOKING
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+  COMPLETED
+}
+
+enum FormSystemType {
+  LEGACY
+  FORM2
+  BOTH
+}
+
+enum PdfTemplateType {
+  INVOICE
+  BOOKING
+  CERTIFICATE
+}
+
+enum EmailTemplateType {
+  INQUIRY
+  BOOKING_CONFIRMATION
+  INVOICE
+  CUSTOM
+}
+
+enum BackgroundJobType {
+  FORM_DELETION
+  FORM_DUPLICATION
+  EMAIL_PROCESSING
+}

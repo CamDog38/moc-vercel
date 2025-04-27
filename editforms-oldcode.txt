@@ -1,0 +1,2231 @@
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\repositories\form\operations\formQueries.ts
+
+/**
+ * Form Query Operations
+ * 
+ * This file contains operations for querying forms.
+ */
+
+import { Form } from '@prisma/client';
+import { Form2Model } from '../../../core/types';
+import { prisma } from '../../../../../lib/prisma';
+import { info, error } from '@/util/logger';
+
+/**
+ * Get all forms for a user
+ */
+export async function getAllForms(userId: string): Promise<Form2Model[]> {
+  // Find all forms for the user
+  const forms = await prisma.form.findMany({
+    where: {
+      userId,
+    },
+    orderBy: {
+      updatedAt: 'desc',
+    },
+  });
+  
+  // Filter forms to include those with version 2.0 or with "2.0" in their name
+  const form2Models = forms.filter(form => {
+    // Check if the form name contains "2.0" - this is a strong indicator it's a Form 2.0 form
+    if (form.name && form.name.includes('2.0')) {
+      info(`Including form ${form.id} (${form.name}) as Form 2.0 based on name`, 'forms');
+      return true;
+    }
+    
+    try {
+      // If no fields, check if we already included it based on name
+      if (!form.fields) return false;
+      
+      // Handle both string and object types for fields
+      let fieldsObj;
+      if (typeof form.fields === 'string') {
+        fieldsObj = JSON.parse(form.fields);
+      } else {
+        fieldsObj = form.fields;
+      }
+      
+      // Check for version 2.0 specifically
+      return fieldsObj.version === '2.0';
+    } catch (e) {
+      error('Error parsing form fields:', 'forms', { error: e, formId: form.id });
+      return false;
+    }
+  });
+  
+  info(`Found ${form2Models.length} Form System 2.0 forms out of ${forms.length} total forms`, 'forms');
+  
+  // Convert to Form2Model format
+  return form2Models.map(form => {
+    // Extract metadata from fields
+    let fieldsObj: any = {};
+    try {
+      if (form.fields) {
+        fieldsObj = typeof form.fields === 'string' 
+          ? JSON.parse(form.fields as string) 
+          : form.fields;
+      }
+    } catch (e) {
+      error('Error parsing fields for form', 'forms', { formId: form.id, error: e });
+    }
+    
+    return {
+      id: form.id,
+      name: form.name,
+      description: form.description || undefined,
+      type: form.type,
+      isActive: form.isActive,
+      userId: form.userId,
+      createdAt: form.createdAt,
+      updatedAt: form.updatedAt,
+      isMultiPage: form.isMultiPage,
+      // Use metadata from fields object if available
+      submitButtonText: fieldsObj.submitButtonText || undefined,
+      successMessage: fieldsObj.successMessage || undefined,
+      fields: typeof form.fields === 'string' ? form.fields : JSON.stringify(form.fields),
+      sections: form.sections ? (typeof form.sections === 'string' ? form.sections : JSON.stringify(form.sections)) : undefined
+    };
+  });
+}
+
+/**
+ * Get a form by ID
+ */
+export async function getFormById(id: string): Promise<Form2Model | null> {
+  try {
+    // First, get the basic form data without includes
+    const form = await prisma.form.findUnique({
+      where: {
+        id,
+      }
+    });
+
+    if (!form) {
+      return null;
+    }
+
+    // In a separate query, get the form sections and fields
+    const formSections = await prisma.formSection.findMany({
+      where: {
+        formId: id
+      },
+      include: {
+        fields: true
+      },
+      orderBy: {
+        order: 'asc'
+      }
+    });
+
+    // Store the sections data in the form's sections field as JSON
+    // This approach works with the existing Form2Model type
+    let sectionsData = JSON.stringify(formSections);
+
+    // Extract metadata from fields
+    let fieldsObj: any = {};
+    try {
+      if (form.fields) {
+        fieldsObj = typeof form.fields === 'string' 
+          ? JSON.parse(form.fields as string) 
+          : form.fields;
+      }
+    } catch (e) {
+      error('Error parsing fields for form', 'forms', { formId: form.id, error: e });
+    }
+    
+    // Convert to Form2Model format
+    return {
+      id: form.id,
+      name: form.name,
+      description: form.description || undefined,
+      type: form.type,
+      isActive: form.isActive,
+      userId: form.userId,
+      createdAt: form.createdAt,
+      updatedAt: form.updatedAt,
+      isMultiPage: form.isMultiPage,
+      // Use metadata from fields object if available
+      submitButtonText: fieldsObj.submitButtonText || undefined,
+      successMessage: fieldsObj.successMessage || undefined,
+      fields: typeof form.fields === 'string' ? form.fields : JSON.stringify(form.fields),
+      // Store the sections data in the sections field
+      sections: sectionsData
+    };
+  } catch (e) {
+    error(`Error retrieving form by ID: ${id}`, 'forms', { error: e });
+    return null;
+  }
+}
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\repositories\form\operations\formConfigOperations.ts
+
+/**
+ * Form Configuration Operations
+ * 
+ * This file contains operations for managing form configurations.
+ */
+
+import { Form, Prisma } from '@prisma/client';
+import { FormConfig } from '../../../core/types';
+import { prisma } from '../../../../../lib/prisma';
+import { saveFormSectionsAndFields, deleteFormSectionsAndFields } from '../sectionFieldOperations';
+import { extractFormMetadata, updateFormMetadata } from '../configConverter';
+import { createForm } from './formMutations';
+
+// Define extended types for form sections and fields to include stableId
+interface ExtendedFormSection extends Record<string, any> {
+  id?: string;
+  title?: string;
+  description?: string;
+  order?: number;
+  stableId?: string;
+  fields?: ExtendedFormField[];
+}
+
+interface ExtendedFormField extends Record<string, any> {
+  id?: string;
+  type?: string;
+  label?: string;
+  placeholder?: string | null;
+  helpText?: string | null;
+  required?: boolean;
+  order?: number;
+  mapping?: string | null;
+  stableId?: string;
+  name?: string;
+}
+
+/**
+ * Save form configuration
+ */
+export async function saveFormConfig(formConfig: FormConfig, userId: string): Promise<Form> {
+  // Extract metadata from the form config
+  const { 
+    title, 
+    description, 
+    submitButtonText, 
+    successMessage, 
+    isMultiPage, 
+    isPublic 
+  } = formConfig;
+  
+  // Create a new form
+  const form = await createForm({
+    title,
+    description,
+    type: 'standard',
+    userId,
+    isActive: true,
+    isPublic,
+    submitButtonText,
+    successMessage,
+    formConfig,
+  });
+  
+  // Save sections and fields
+  await saveFormSectionsAndFields(form.id, formConfig);
+  
+  return form;
+}
+
+/**
+ * Update an existing form's configuration
+ */
+export async function updateFormConfig(formId: string, formConfig: FormConfig): Promise<Form> {
+  try {
+    console.log(`Updating form configuration for ${formId}`);
+    
+    // Extract metadata from the form config
+    const { 
+      title, 
+      description, 
+      submitButtonText, 
+      successMessage, 
+      isMultiPage = false, 
+      isPublic 
+    } = formConfig;
+    
+    // Get the current form to access its fields
+    const currentForm = await prisma.form.findUnique({
+      where: { id: formId },
+      select: { fields: true },
+    });
+    
+    if (!currentForm) {
+      throw new Error(`Form with ID ${formId} not found`);
+    }
+    
+    // Extract existing metadata from fields
+    const existingMetadata = extractFormMetadata(currentForm.fields);
+    
+    // Prepare updates to metadata
+    const metadataUpdates: Record<string, any> = {
+      submitButtonText: submitButtonText || '',
+      successMessage: successMessage || '',
+      isPublic: isPublic !== undefined ? isPublic : false,
+    };
+    
+    // Update metadata with the new values
+    const updatedMetadata = JSON.parse(updateFormMetadata(existingMetadata, metadataUpdates));
+    
+    // First, delete existing sections and fields
+    console.log('Deleting existing sections and fields...');
+    const sections = await prisma.formSection.findMany({
+      where: { formId },
+      select: { id: true },
+    });
+    
+    console.log(`Found ${sections.length} sections to delete`);
+    
+    if (sections.length > 0) {
+      // Delete all sections in a single query (will cascade to fields)
+      await prisma.formSection.deleteMany({
+        where: {
+          id: {
+            in: sections.map(section => section.id)
+          }
+        }
+      });
+      console.log(`Deleted ${sections.length} sections and their fields`);
+    }
+    
+    // Step 2: Create new sections and fields without using a single large transaction
+    console.log('Creating new sections and fields...');
+    
+    // Prepare all sections for bulk creation
+    const sectionCreateData: Prisma.FormSectionCreateManyInput[] = [];
+    const sectionMap: Map<number, ExtendedFormSection> = new Map();
+    
+    for (const [index, sectionData] of formConfig.sections.entries()) {
+      // Cast section to our extended type
+      const section = sectionData as ExtendedFormSection;
+      
+      // Prepare section data for bulk creation
+      const sectionCreateInput: Prisma.FormSectionCreateManyInput = {
+        formId,
+        title: section.title || '',
+        description: section.description || '',
+        order: index,
+      };
+      
+      // Add stableId if it exists
+      if (section.stableId) {
+        (sectionCreateInput as any).stableId = section.stableId;
+      }
+      
+      sectionCreateData.push(sectionCreateInput);
+      sectionMap.set(index, section);
+    }
+    
+    // Create all sections in a single bulk operation
+    console.log(`Creating ${sectionCreateData.length} sections in bulk...`);
+    await prisma.formSection.createMany({
+      data: sectionCreateData,
+      skipDuplicates: false,
+    });
+    
+    // Fetch the created sections to get their IDs
+    const createdSections = await prisma.formSection.findMany({
+      where: { formId },
+      orderBy: { order: 'asc' },
+    });
+    
+    console.log(`Retrieved ${createdSections.length} created sections`);
+    
+    // Map sections to their original data
+    const sectionFieldMap: Array<{ section: ExtendedFormSection, dbSection: any }> = [];
+    
+    // Match created sections with their original data by order
+    for (let i = 0; i < createdSections.length; i++) {
+      const dbSection = createdSections[i];
+      const section = sectionMap.get(dbSection.order);
+      
+      if (section) {
+        sectionFieldMap.push({
+          section,
+          dbSection
+        });
+      }
+    }
+    
+    // Now create all fields for all sections in a single bulk operation
+    // Prepare all field create operations
+    const allFieldCreateData: Prisma.FormFieldCreateManyInput[] = [];
+    
+    for (const { section, dbSection } of sectionFieldMap) {
+      if (section.fields && Array.isArray(section.fields)) {
+        for (const [fieldIndex, fieldData] of section.fields.entries()) {
+          // Cast field to our extended type
+          const field = fieldData as ExtendedFormField;
+          
+          // Prepare options JSON
+          const customProps: Record<string, any> = {};
+          
+          // Include the name in options
+          if (field.name) {
+            customProps.name = field.name;
+          }
+          
+          // Add any other custom properties
+          for (const [key, value] of Object.entries(field)) {
+            if (!['id', 'sectionId', 'type', 'label', 'placeholder', 'helpText', 'required', 'order', 'mapping', 'stableId'].includes(key)) {
+              customProps[key] = value;
+            }
+          }
+          
+          // Prepare the field data for bulk creation
+          const fieldCreateData: Prisma.FormFieldCreateManyInput = {
+            sectionId: dbSection.id,
+            type: field.type || 'text',
+            label: field.label || '',
+            placeholder: field.placeholder || null,
+            helpText: field.helpText || null,
+            required: field.required === true,
+            order: fieldIndex,
+            mapping: field.mapping ? 
+              (typeof field.mapping === 'string' ? field.mapping : 
+               typeof field.mapping === 'object' ? JSON.stringify(field.mapping) : null) : null,
+            options: Object.keys(customProps).length > 0 ? customProps : undefined,
+            // Add conditionalLogic separately to ensure it's included in the database
+            conditionalLogic: field.conditionalLogic ? 
+              (typeof field.conditionalLogic === 'string' ? field.conditionalLogic : 
+               JSON.stringify(field.conditionalLogic)) : Prisma.JsonNull,
+          };
+          
+          // Add stableId if it exists
+          if (field.stableId) {
+            (fieldCreateData as any).stableId = field.stableId;
+          }
+          
+          allFieldCreateData.push(fieldCreateData);
+        }
+        
+        console.log(`Prepared ${section.fields.length} fields for section ${dbSection.id}`);
+      }
+    }
+    
+    // Create all fields in a single bulk operation
+    if (allFieldCreateData.length > 0) {
+      console.log(`Creating ${allFieldCreateData.length} fields in bulk...`);
+      const result = await prisma.formField.createMany({
+        data: allFieldCreateData,
+        skipDuplicates: false,
+      });
+      console.log(`Successfully created ${result.count} fields in bulk`);
+    }
+    
+    console.log('Successfully created all sections and fields');
+    
+    // Step 3: Update the form with the new configuration
+    console.log('Updating form with new configuration...');
+    console.log('Setting isPublic to:', isPublic);
+    
+    // Store isPublic in the fields JSON field since it's not a direct column in the database
+    const updatedForm = await prisma.form.update({
+      where: { id: formId },
+      data: {
+        name: title,
+        description: description || null, // Ensure description is never undefined
+        fields: JSON.stringify(updatedMetadata), // isPublic is included in updatedMetadata
+        isMultiPage: isMultiPage,
+      }
+    });
+    
+    console.log(`Successfully updated form ${formId}`);
+    return updatedForm;
+  } catch (error) {
+    console.error(`Error updating form configuration for ${formId}:`, error);
+    throw error;
+  }
+}
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\lib\forms2\repositories\form\fieldOperations\fieldOperations.ts
+
+/**
+ * Form Field Operations
+ * 
+ * This file contains operations for managing form fields.
+ */
+
+import { Prisma } from '@prisma/client';
+import { prisma } from '../../../../../lib/prisma';
+import { FieldConfig } from '../../../core/types';
+import * as logger from '@/util/logger';
+
+// Import the correct LogSource type from the logger module
+type LogSource = 'leads' | 'bookings' | 'emails' | 'forms' | 'invoices' | 'api' | 'auth' | 'system' | 'other';
+
+// Use the correct log source for forms
+const FORMS_LOG_SOURCE: LogSource = 'forms';
+
+// Define a more comprehensive field config type that includes all properties we need
+export interface ExtendedFieldConfig {
+  id: string;
+  type: string;
+  label: string;
+  name?: string;
+  placeholder?: string;
+  helpText?: string;
+  required?: boolean;
+  disabled?: boolean;
+  hidden?: boolean;
+  order?: number;
+  stableId?: string;
+  inUseByRules?: boolean;
+  conditionalLogic?: any;
+  mapping?: any;
+  [key: string]: any; // Allow for any additional properties
+}
+
+/**
+ * Create fields for a section
+ */
+export async function createFieldsForSection(sectionId: string, fields: ExtendedFieldConfig[]): Promise<void> {
+  logger.info(`Creating ${fields.length} fields for section ${sectionId}`, FORMS_LOG_SOURCE);
+  
+  // Create each field
+  for (const [fieldIndex, field] of fields.entries()) {
+    try {
+      // Extract field properties with defaults
+      const { 
+        id, 
+        type, 
+        label, 
+        name, 
+        placeholder, 
+        helpText, 
+        required = false, 
+        stableId, 
+        inUseByRules = false,
+        conditionalLogic,
+        mapping,
+        order = fieldIndex,
+        ...otherProps 
+      } = field;
+      
+      // Prepare custom properties for the field
+      const customProps: { [key: string]: any } = {};
+      for (const [key, value] of Object.entries(field)) {
+        if (!['id', 'sectionId', 'type', 'label', 'placeholder', 'helpText', 'required', 'order', 'mapping', 'stableId'].includes(key)) {
+          // Special handling for conditionalLogic - ensure it's included in both places
+          if (key === 'conditionalLogic') {
+            // Don't add to customProps as we'll handle it separately
+            console.log(`Found conditionalLogic for field ${field.id}:`, value);
+          } else {
+            customProps[key] = value;
+          }
+        }
+      }
+      
+      // Process conditional logic for the field
+      let fieldConditionalLogic = null;
+      if (conditionalLogic) {
+        try {
+          if (typeof conditionalLogic === 'string') {
+            fieldConditionalLogic = conditionalLogic;
+          } else {
+            fieldConditionalLogic = JSON.stringify(conditionalLogic);
+          }
+        } catch (error) {
+          console.error(`Error stringifying conditional logic for field ${id}:`, error);
+          logger.error(`Error stringifying field conditional logic: ${error instanceof Error ? error.message : String(error)}`, FORMS_LOG_SOURCE);
+        }
+      }
+      
+      // Process mapping for the field
+      let fieldMapping = null;
+      if (mapping) {
+        try {
+          if (typeof mapping === 'string') {
+            fieldMapping = mapping;
+          } else {
+            fieldMapping = JSON.stringify(mapping);
+          }
+        } catch (error) {
+          console.error(`Error stringifying mapping for field ${id}:`, error);
+          logger.error(`Error stringifying field mapping: ${error instanceof Error ? error.message : String(error)}`, FORMS_LOG_SOURCE);
+        }
+      }
+
+      // Include the name in the options JSON since it's not a direct field in the database schema
+      if (name) {
+        customProps.name = name;
+      }
+      
+      // Store type-specific config in options if needed
+      const options = Object.keys(customProps).length > 0 ? JSON.stringify(customProps) : null;
+      if (options) {
+        console.log(`Field ${id} has additional options:`, customProps);
+      }
+
+      // Ensure required is properly handled as a boolean
+      const isRequired = required === true;
+
+      // Create the field with explicit type handling
+      console.log(`Creating field in database: ${id}, type=${type}, section=${sectionId}`);
+      const createdField = await prisma.formField.create({
+        data: {
+          type: String(type),
+          label: String(label || ''),
+          placeholder: placeholder ? String(placeholder) : null,
+          helpText: helpText ? String(helpText) : null,
+          required: isRequired, // Explicitly use the boolean value
+          order: typeof order === 'number' ? order : fieldIndex,
+          sectionId: sectionId,
+          options: options ? (options as any) : Prisma.JsonNull,
+          validation: Prisma.JsonNull,
+          // Process conditional logic separately to ensure it's saved correctly
+          conditionalLogic: conditionalLogic ? 
+            (typeof conditionalLogic === 'string' ? conditionalLogic : 
+             JSON.stringify(conditionalLogic)) : Prisma.JsonNull,
+          mapping: mapping ? 
+            (typeof mapping === 'string' ? mapping : 
+             typeof mapping === 'object' ? JSON.stringify(mapping) : null) : null,
+          stableId: String(stableId || id),
+          inUseByRules: inUseByRules === true,
+        },
+      });
+      console.log(`Successfully created field: ${createdField.id}`);
+    } catch (error) {
+      console.error(`Error creating field in section ${sectionId}:`, error);
+      logger.error(`Error creating field in section ${sectionId}: ${error instanceof Error ? error.message : String(error)}`, FORMS_LOG_SOURCE);
+      throw error; // Re-throw to ensure the transaction fails
+    }
+  }
+  
+  console.log(`Successfully created all ${fields.length} fields for section ${sectionId}`);
+}
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\ui\FormField.tsx
+
+/**
+ * Form Field Component
+ * 
+ * A reusable component for managing form fields in the form builder.
+ * Extracted from the create page to ensure consistency between create and edit pages.
+ */
+
+import { useState } from 'react';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Checkbox } from '@/components/ui/checkbox';
+import { 
+  Select, 
+  SelectContent, 
+  SelectItem, 
+  SelectTrigger, 
+  SelectValue 
+} from '@/components/ui/select';
+import { Trash2, MapPin, SlidersHorizontal, GripVertical } from 'lucide-react';
+import { FieldConfig, FieldType, FieldMapping, ConditionalLogic } from '@/lib/forms2/core/types';
+import FieldMappingSelector from '@/components/forms2/FieldMappingSelector';
+import ConditionalLogicBuilder from '@/components/forms2/conditionalLogic';
+import FieldNameInput from './FieldNameInput';
+
+interface FormFieldProps {
+  field: FieldConfig;
+  availableFields: FieldConfig[];
+  onUpdate: (updates: Partial<FieldConfig>) => void;
+  onDelete: () => void;
+  dragHandleProps?: any; // For field drag handle
+  sectionTitle?: string; // Section title for generating field names
+}
+
+export default function FormField({
+  field,
+  availableFields,
+  onUpdate,
+  onDelete,
+  dragHandleProps,
+  sectionTitle
+}: FormFieldProps) {
+  const [expanded, setExpanded] = useState(true);
+  
+  const fieldTypes = [
+    { value: 'text', label: 'Text' },
+    { value: 'textarea', label: 'Text Area' },
+    { value: 'email', label: 'Email' },
+    { value: 'tel', label: 'Phone' },
+    { value: 'number', label: 'Number' },
+    { value: 'date', label: 'Date' },
+    { value: 'dob', label: 'Date of Birth' },
+    { value: 'datetime-local', label: 'Date & Time (with toggle)' },
+    { value: 'select', label: 'Dropdown' },
+    { value: 'checkbox', label: 'Checkbox' },
+    { value: 'radio', label: 'Radio' },
+    { value: 'file', label: 'File Upload' }
+  ];
+
+  return (
+    <Card className="mb-4 border border-gray-200 relative">
+      <CardContent className="p-4">
+        <div className="flex justify-between items-center mb-4">
+          <div className="flex items-center flex-1 gap-2">
+            {/* Drag handle for field */}
+            <div 
+              {...dragHandleProps} 
+              className="cursor-grab text-muted-foreground hover:text-foreground"
+            >
+              <GripVertical className="h-4 w-4" />
+            </div>
+            
+            <div className="text-xs text-muted-foreground bg-muted px-2 py-1 rounded">
+              {field.type}
+            </div>
+            
+            <div className="flex-1">
+              <Input
+                placeholder="Field Label"
+                value={field.label || ''}
+                onChange={(e) => {
+                  // Always generate a slug from the label for the field name
+                  let slug = e.target.value
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]/g, '_')
+                    .replace(/_+/g, '_')
+                    .replace(/^_|_$/g, '');
+                  
+                  // If we have a section title, prefix the slug with the section name
+                  if (sectionTitle) {
+                    const sectionSlug = sectionTitle
+                      .toLowerCase()
+                      .replace(/[^a-z0-9]/g, '_')
+                      .replace(/_+/g, '_')
+                      .replace(/^_|_$/g, '');
+                    
+                    // Combine section name and field name
+                    slug = `${sectionSlug}_${slug}`;
+                  }
+                  
+                  // Always update both the label and the field name
+                  onUpdate({ 
+                    label: e.target.value,
+                    name: slug || `field_${field.id.substring(0, 6)}`
+                  });
+                }}
+                className="font-medium"
+              />
+            </div>
+          </div>
+          
+          <Button 
+            variant="ghost" 
+            size="sm"
+            onClick={onDelete}
+            className="text-destructive hover:text-destructive"
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+        
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div className="space-y-2">
+            <Label htmlFor={`field-${field.id}-type`}>Field Type</Label>
+            <Select
+              value={field.type as string}
+              onValueChange={(value) => onUpdate({ type: value as FieldType })}
+            >
+              <SelectTrigger id={`field-${field.id}-type`}>
+                <SelectValue placeholder="Select field type" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="text">Text</SelectItem>
+                <SelectItem value="textarea">Text Area</SelectItem>
+                <SelectItem value="email">Email</SelectItem>
+                <SelectItem value="tel">Phone</SelectItem>
+                <SelectItem value="number">Number</SelectItem>
+                <SelectItem value="date">Date</SelectItem>
+                <SelectItem value="dob">Date of Birth</SelectItem>
+                <SelectItem value="datetime-local">Date & Time (with toggle)</SelectItem>
+                <SelectItem value="select">Dropdown</SelectItem>
+                <SelectItem value="checkbox">Checkbox</SelectItem>
+                <SelectItem value="radio">Radio</SelectItem>
+                <SelectItem value="file">File Upload</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          
+          {/* Field Name Input - Using the specialized component */}
+          <FieldNameInput
+            id={`field-${field.id}-name`}
+            value={field.name || ''}
+            sectionTitle={sectionTitle}
+            onChange={(name) => onUpdate({ name })}
+          />
+        </div>
+        
+        <div className="mt-4 space-y-2">
+          <Label htmlFor={`field-${field.id}-placeholder`}>Placeholder</Label>
+          <Input
+            id={`field-${field.id}-placeholder`}
+            placeholder="Enter placeholder text"
+            value={field.placeholder || ''}
+            onChange={(e) => onUpdate({ placeholder: e.target.value })}
+          />
+        </div>
+        
+        {/* Options for dropdown, radio, and checkbox fields */}
+        {(field.type === 'select' || field.type === 'radio' || field.type === 'checkbox') && (
+          <div className="mt-4 space-y-2">
+            <Label>Options</Label>
+            <div className="border border-gray-200 rounded-md p-2 space-y-2">
+              {/* Display existing options */}
+              {(() => {
+                // Get the options array from the field
+                const fieldOptions = (field as any).options;
+                
+                // Handle different formats of options
+                let optionsArray;
+                
+                if (!fieldOptions) {
+                  // No options at all
+                  optionsArray = [];
+                } else if (Array.isArray(fieldOptions)) {
+                  // Options is already an array
+                  optionsArray = fieldOptions;
+                } else if (typeof fieldOptions === 'object' && Array.isArray(fieldOptions.options)) {
+                  // Options is an object with a nested options array
+                  // This matches your JSON structure: {"name": "...", "options": [...]}
+                  optionsArray = fieldOptions.options;
+                } else {
+                  // Fallback to empty array
+                  optionsArray = [];
+                }
+                
+                return optionsArray;
+              })().map((option: any, index: number) => (
+                <div key={option.id || index} className="flex items-center gap-2 mb-2">
+                  <Input
+                    value={option.label || ''}
+                    onChange={(e) => {
+                      const updatedOptions = [...((field as any).options || [])];
+                      updatedOptions[index] = {
+                        ...updatedOptions[index],
+                        id: option.id || `option_${Date.now()}_${index}`,
+                        label: e.target.value,
+                        value: e.target.value.toLowerCase().replace(/\s+/g, '_')
+                      };
+                      
+                      // Log the update for debugging
+                      console.log(`Updating option at index ${index}:`, updatedOptions[index]);
+                      
+                      onUpdate({ options: updatedOptions });
+                    }}
+                    placeholder="Option label"
+                    className="flex-1"
+                  />
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-destructive"
+                    onClick={() => {
+                      // Get the current options array in the correct format
+                      let currentOptions;
+                      const fieldOptions = (field as any).options;
+                      
+                      if (Array.isArray(fieldOptions)) {
+                        currentOptions = fieldOptions;
+                      } else if (typeof fieldOptions === 'object' && Array.isArray(fieldOptions.options)) {
+                        currentOptions = fieldOptions.options;
+                      } else {
+                        currentOptions = [];
+                      }
+                      
+                      const updatedOptions = [...currentOptions];
+                      updatedOptions.splice(index, 1);
+                      
+                      // Update in the correct format based on the current structure
+                      if (typeof fieldOptions === 'object' && !Array.isArray(fieldOptions) && fieldOptions.name) {
+                        // If options is an object with a name property, maintain that structure
+                        onUpdate({
+                          options: {
+                            name: fieldOptions.name,
+                            options: updatedOptions
+                          } as any // Use type assertion to avoid TypeScript error
+                        });
+                      } else {
+                        // Otherwise just update with the array directly
+                        onUpdate({ options: updatedOptions as any }); // Use type assertion to avoid TypeScript error
+                      }
+                      console.log(`Removing option at index ${index}`);
+                      console.log('Updated options after removal:', updatedOptions);
+                    }}
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+              
+              {/* Add Option button */}
+              <Button
+                variant="outline"
+                size="sm"
+                className="w-full flex items-center justify-center gap-1"
+                onClick={() => {
+                  // Get the existing options in the correct format
+                  let existingOptions: any[] = [];
+                  const fieldOptionsData = (field as any).options;
+                  
+                  if (!fieldOptionsData) {
+                    existingOptions = [];
+                  } else if (Array.isArray(fieldOptionsData)) {
+                    existingOptions = [...fieldOptionsData];
+                  } else if (typeof fieldOptionsData === 'object' && Array.isArray(fieldOptionsData.options)) {
+                    // This matches your JSON structure: {"name": "...", "options": [...]}
+                    existingOptions = [...fieldOptionsData.options];
+                  } else {
+                    existingOptions = [];
+                  }
+                  const newOption = {
+                    id: `option_${Date.now()}`,
+                    label: `Option ${existingOptions.length + 1}`,
+                    value: `option${existingOptions.length + 1}`
+                  };
+                  
+                  // Create a new array to ensure React detects the change
+                  const updatedOptions = [...existingOptions, newOption];
+                  console.log('Adding new option:', newOption);
+                  console.log('Updated options array:', updatedOptions);
+                  
+                  // Ensure all options have IDs
+                  const validatedOptions = updatedOptions.map(opt => ({
+                    id: opt.id || `option_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+                    label: opt.label || '',
+                    value: opt.value || ''
+                  }));
+                  
+                  console.log('Validated options array:', validatedOptions);
+                  
+                  // Update in the correct format based on the current structure
+                  const fieldOptionsFormat = (field as any).options;
+                  
+                  if (typeof fieldOptionsFormat === 'object' && !Array.isArray(fieldOptionsFormat) && fieldOptionsFormat.name) {
+                    // If options is an object with a name property, maintain that structure
+                    // Use type assertion to handle the custom structure
+                    onUpdate({
+                      options: {
+                        name: fieldOptionsFormat.name,
+                        options: validatedOptions
+                      } as any // Use type assertion to avoid TypeScript error
+                    });
+                  } else {
+                    // Otherwise just update with the array directly
+                    onUpdate({
+                      options: validatedOptions as any // Use type assertion to avoid TypeScript error
+                    });
+                  }
+                }}
+              >
+                <span>+</span> Add Option
+              </Button>
+            </div>
+          </div>
+        )}
+        
+        <div className="mt-4 flex items-center">
+          <Checkbox 
+            id={`field-${field.id}-required`}
+            checked={field.required || false}
+            onCheckedChange={(checked) => onUpdate({ required: !!checked })}
+          />
+          <Label htmlFor={`field-${field.id}-required`} className="ml-2">
+            Required Field
+          </Label>
+        </div>
+        
+        {/* Field Mapping */}
+        <div className="mt-4">
+          <div className="flex items-center mb-1">
+            <MapPin className="h-3 w-3 mr-1" />
+            <Label className="text-sm font-medium">Field Mapping</Label>
+          </div>
+          <div className="w-full">
+            <FieldMappingSelector
+              value={field.mapping}
+              onChange={(mapping) => {
+                // When mapping is set, ensure the field name is properly set
+                if (mapping) {
+                  let mappingName = mapping.type === 'custom' && mapping.customKey
+                    ? mapping.customKey.toLowerCase().replace(/[^a-z0-9]/g, '_')
+                    : mapping.type.toLowerCase().replace(/[^a-z0-9]/g, '_');
+                  
+                  // If we have a section title, prefix the mapping name with the section name
+                  if (sectionTitle) {
+                    const sectionSlug = sectionTitle
+                      .toLowerCase()
+                      .replace(/[^a-z0-9]/g, '_')
+                      .replace(/_+/g, '_')
+                      .replace(/^_|_$/g, '');
+                    
+                    // Combine section name and mapping name
+                    mappingName = `${sectionSlug}_${mappingName}`;
+                  }
+                  
+                  // Always update the name when editing the mapping
+                  onUpdate({ 
+                    mapping,
+                    name: mappingName
+                  });
+                } else {
+                  onUpdate({ mapping });
+                }
+              }}
+              fieldType={field.type}
+              label=""
+            />
+          </div>
+        </div>
+
+        {/* Conditional Logic */}
+        <div className="mt-4">
+          <div className="flex items-center mb-1">
+            <SlidersHorizontal className="h-3 w-3 mr-1" />
+            <Label className="text-sm font-medium">Conditional Logic</Label>
+          </div>
+          <div className="w-full">
+            <ConditionalLogicBuilder
+              value={field.conditionalLogic}
+              onChange={(conditionalLogic) => {
+                console.log('[FORM FIELD] Updating conditional logic:', conditionalLogic);
+                console.log('[FORM FIELD] Field ID:', field.id);
+                console.log('[FORM FIELD] Field type:', field.type);
+                
+                // Create a deep copy of the conditional logic to avoid reference issues
+                const conditionalLogicCopy = conditionalLogic ? JSON.parse(JSON.stringify(conditionalLogic)) : null;
+                
+                // Update both the conditionalLogic property and include it in options
+                const updates: any = { conditionalLogic: conditionalLogicCopy };
+                
+                // Also add to options if it exists
+                const fieldOptions = (field as any).options;
+                if (fieldOptions) {
+                  if (typeof fieldOptions === 'object' && !Array.isArray(fieldOptions)) {
+                    // If options is an object, add conditionalLogic to it
+                    updates.options = {
+                      ...fieldOptions,
+                      conditionalLogic: conditionalLogicCopy
+                    };
+                  } else if (Array.isArray(fieldOptions)) {
+                    // If options is an array, wrap it in an object
+                    updates.options = {
+                      options: fieldOptions,
+                      conditionalLogic: conditionalLogicCopy
+                    };
+                  }
+                }
+                
+                console.log('[FORM FIELD] Sending updates:', updates);
+                onUpdate(updates);
+              }}
+              availableFields={availableFields}
+              currentFieldId={field.id}
+            />
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\public\helpers\optionsHelper.ts
+
+/**
+ * Options Helper Functions
+ * 
+ * Helper functions for handling field options in different formats
+ */
+
+import { FieldOption } from '@/lib/forms2/core/types';
+
+/**
+ * Parse options from different formats
+ */
+export function parseOptions(options: any, fieldId: string, fieldLabel?: string): FieldOption[] {
+  // Default options to use when needed
+  const defaultOptions: FieldOption[] = [
+    { id: 'option1', value: 'option1', label: 'Option 1' },
+    { id: 'option2', value: 'option2', label: 'Option 2' },
+    { id: 'option3', value: 'option3', label: 'Option 3' }
+  ];
+  
+  // Handle null or undefined options
+  if (!options) {
+    console.log(`No options provided for field ${fieldId}, using defaults`);
+    return defaultOptions;
+  }
+  
+  // Log the options structure for debugging
+  console.log(`[DEBUG] Raw options for field ${fieldId}:`, options);
+  
+  try {
+    // Handle string format (JSON string)
+    if (typeof options === 'string') {
+      try {
+        // Try to parse as JSON
+        const parsedOptions = JSON.parse(options);
+        
+        // Handle array format after parsing
+        if (Array.isArray(parsedOptions)) {
+          return parsedOptions.map(opt => normalizeOption(opt));
+        }
+        
+        // Handle object format after parsing
+        if (typeof parsedOptions === 'object' && parsedOptions !== null) {
+          return Object.entries(parsedOptions).map(([key, value]) => ({
+            id: key,
+            value: key,
+            label: typeof value === 'string' ? value : key
+          }));
+        }
+      } catch (e) {
+        // Not valid JSON, try as comma-separated list
+        if (options.includes(',')) {
+          return options.split(',').map(opt => ({
+            id: opt.trim(),
+            value: opt.trim(),
+            label: opt.trim()
+          }));
+        }
+        // Single option
+        return [{
+          id: options,
+          value: options,
+          label: options
+        }];
+      }
+    }
+    
+    // Handle array format (already parsed)
+    if (Array.isArray(options)) {
+      // If array is empty, return default options
+      if (options.length === 0) {
+        return defaultOptions;
+      }
+      
+      // Process each option in the array
+      return options.map((opt: any) => {
+        // If the option is just a string, use it as is
+        if (typeof opt === 'string') {
+          return {
+            id: opt,
+            value: opt,
+            label: opt
+          };
+        }
+        
+        // If the option is an object but doesn't have proper structure
+        // This is likely the case with [object Object] showing up
+        if (typeof opt === 'object' && opt !== null) {
+          // If it has a label property, use that
+          if ('label' in opt && typeof opt.label === 'string') {
+            return {
+              id: opt.id || opt.value || opt.label,
+              value: opt.value || opt.id || opt.label,
+              label: opt.label
+            };
+          }
+          
+          // If it has a value property, use that
+          if ('value' in opt && (typeof opt.value === 'string' || typeof opt.value === 'number')) {
+            const valueStr = String(opt.value);
+            return {
+              id: opt.id || valueStr,
+              value: valueStr,
+              label: opt.label || valueStr
+            };
+          }
+          
+          // Last resort: stringify the object but make it readable
+          try {
+            const stringValue = JSON.stringify(opt)
+              .replace(/[{}"'\[\]]/g, '')
+              .replace(/,/g, ' ');
+            return {
+              id: stringValue,
+              value: stringValue,
+              label: stringValue
+            };
+          } catch (e) {
+            // If all else fails, use a placeholder
+            return {
+              id: `option-${Math.random().toString(36).substring(2, 9)}`,
+              value: `option-${Math.random().toString(36).substring(2, 9)}`,
+              label: 'Option'
+            };
+          }
+        }
+        
+        // Fallback for any other type
+        return normalizeOption(opt);
+      });
+    }
+    
+    // Handle object format (key-value pairs)
+    if (options && typeof options === 'object' && !Array.isArray(options)) {
+      // Check for the nested structure: { name: "field_name", options: [...] }
+      if (options.options && Array.isArray(options.options)) {
+        console.log(`Found nested options structure for field ${fieldId}:`, options);
+        // Use the nested options array
+        return options.options.map((opt: any) => normalizeOption(opt));
+      }
+      
+      // Special case for dropdown fields in the database
+      if (Array.isArray(options.options)) {
+        return options.options.map((opt: any) => normalizeOption(opt));
+      }
+      
+      // Make sure we're not just converting the field object itself
+      if ('type' in options && 'id' in options) {
+        return defaultOptions;
+      }
+      
+      // Convert object to key-value pairs
+      return Object.entries(options).map(([key, value]) => ({
+        id: key,
+        value: key,
+        label: typeof value === 'string' ? value : key
+      }));
+    }
+  } catch (e) {
+    // If any error occurs during processing, return default options
+    return defaultOptions;
+  }
+  
+  // If we get here, return default options
+  return defaultOptions;
+}
+
+/**
+ * Normalize option to ensure consistent format
+ */
+export function normalizeOption(option: any): FieldOption {
+  // Handle null or undefined
+  if (option === null || option === undefined) {
+    return { id: '', value: '', label: 'Select an option' };
+  }
+  
+  // Handle string format (simple value)
+  if (typeof option === 'string') {
+    return { id: option, value: option, label: option };
+  }
+  
+  // Handle number format
+  if (typeof option === 'number') {
+    const strValue = String(option);
+    return { id: strValue, value: strValue, label: strValue };
+  }
+  
+  // Handle boolean format
+  if (typeof option === 'boolean') {
+    const strValue = String(option);
+    return { id: strValue, value: strValue, label: strValue };
+  }
+  
+  // Handle object format
+  if (typeof option === 'object') {
+    // First, check for the most common and expected format
+    if ('label' in option && typeof option.label === 'string') {
+      // Make sure we have a string value
+      const value = option.value !== undefined ? String(option.value) : option.label;
+      const id = option.id !== undefined ? String(option.id) : value;
+      return { id, value, label: option.label };
+    }
+    
+    // Check for objects with just a value property
+    if ('value' in option) {
+      const valueStr = String(option.value);
+      // Use the value as the label if no label is provided
+      const label = option.label ? String(option.label) : valueStr;
+      return { id: valueStr, value: valueStr, label };
+    }
+    
+    // Check for objects with a name property (common in some APIs)
+    if ('name' in option && typeof option.name === 'string') {
+      return { 
+        id: String(option.id || option.name), 
+        value: String(option.id || option.name), 
+        label: option.name 
+      };
+    }
+    
+    // Check for objects with a text property (common in some UIs)
+    if ('text' in option && typeof option.text === 'string') {
+      return { 
+        id: String(option.id || option.value || option.text), 
+        value: String(option.value || option.id || option.text), 
+        label: option.text 
+      };
+    }
+    
+    // If it's an array, use the first element as a string
+    if (Array.isArray(option)) {
+      if (option.length === 0) {
+        return { id: '', value: '', label: 'Empty option' };
+      }
+      const firstItem = option[0];
+      if (typeof firstItem === 'string' || typeof firstItem === 'number') {
+        const strValue = String(firstItem);
+        return { id: strValue, value: strValue, label: strValue };
+      }
+    }
+    
+    // Last resort: try to create a meaningful string representation
+    try {
+      // First check if the object has any string properties we can use
+      const stringProps = Object.entries(option)
+        .filter(([_, v]) => typeof v === 'string' || typeof v === 'number')
+        .map(([k, v]) => `${k}: ${v}`);
+      
+      if (stringProps.length > 0) {
+        const stringValue = stringProps.join(', ');
+        return { id: stringValue, value: stringValue, label: stringValue };
+      }
+      
+      // If no string properties, use JSON stringify but clean it up
+      const stringValue = JSON.stringify(option)
+        .replace(/[{}"'\[\]]/g, '')
+        .replace(/,/g, ', ')
+        .trim();
+      
+      // If the string is empty after cleaning, use a fallback
+      if (!stringValue || stringValue === '') {
+        return { 
+          id: `option-${Math.random().toString(36).substring(2, 9)}`, 
+          value: `option-${Math.random().toString(36).substring(2, 9)}`, 
+          label: 'Option' 
+        };
+      }
+      
+      return { id: stringValue, value: stringValue, label: stringValue };
+    } catch (e) {
+      // If JSON stringify fails, use a fallback
+      return { 
+        id: `option-${Math.random().toString(36).substring(2, 9)}`, 
+        value: `option-${Math.random().toString(36).substring(2, 9)}`, 
+        label: 'Option' 
+      };
+    }
+  }
+  
+  // Fallback for any other type
+  return { id: String(option), value: String(option), label: String(option) };
+}
+
+/**
+ * Fetch options from backend API
+ * This function would be used to fetch options from the backend
+ * when needed, such as for dynamic dropdowns
+ */
+export async function fetchOptionsFromBackend(fieldId: string): Promise<FieldOption[]> {
+  try {
+    // This would be replaced with an actual API call
+    const response = await fetch(`/api/forms2/fields/${fieldId}/options`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch options: ${response.statusText}`);
+    }
+    const data = await response.json();
+    return data.options || [];
+  } catch (error) {
+    // Silent error handling in production
+    return [];
+  }
+}
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\public\fields\SelectField.tsx
+
+import React, { useEffect, useState } from 'react';
+import { FieldConfig, FieldOption } from '@/lib/forms2/core/types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { parseOptions, normalizeOption } from '../helpers/optionsHelper';
+
+interface SelectFieldProps {
+  field: FieldConfig;
+  value: any;
+  error?: string;
+  onChange: (value: any) => void;
+  displayLabel: string;
+}
+
+export const SelectField: React.FC<SelectFieldProps> = ({ 
+  field, 
+  value, 
+  error, 
+  onChange,
+  displayLabel
+}) => {
+  const [internalValue, setInternalValue] = useState<string>('placeholder');
+
+  // State is initialized with placeholder
+
+  // Extract and parse options directly (similar to DropdownField)
+  console.log(`[DEBUG] Field data for ${field.id}:`, field);
+  
+  // Extract options based on field structure
+  let optionsToUse = (field as any).options;
+  console.log(`[DEBUG] Initial options for ${field.id}:`, optionsToUse);
+  
+  // Handle different options formats
+  if (optionsToUse) {
+    // Handle double-nested structure: { options: { options: [...] } }
+    if (typeof optionsToUse === 'object' && 
+        !Array.isArray(optionsToUse) && 
+        optionsToUse !== null && 
+        (optionsToUse as any).options) {
+      
+      // Check if options.options is an object with its own options array
+      if (typeof (optionsToUse as any).options === 'object' && 
+          !(optionsToUse as any).options.length && // Not an array
+          (optionsToUse as any).options.options && 
+          Array.isArray((optionsToUse as any).options.options)) {
+        console.log(`[DEBUG] Found double-nested options.options.options array for ${field.id}`);
+        optionsToUse = (optionsToUse as any).options.options;
+      }
+      // Check for single-nested options.options array
+      else if (Array.isArray((optionsToUse as any).options)) {
+        console.log(`[DEBUG] Found single-nested options.options array for ${field.id}`);
+        optionsToUse = (optionsToUse as any).options;
+      }
+    }
+  }
+  
+  // Parse the options
+  const options = parseOptions(optionsToUse, field.id, field.label);
+  console.log(`[DEBUG] Final parsed options for ${field.id}:`, options);
+  
+  // Sync internal state with prop value
+  useEffect(() => {
+    // Check if value is valid and different from current internal value
+    if (value !== undefined && value !== null && value !== '' && value !== internalValue) {
+      setInternalValue(value);
+    } else if ((value === undefined || value === null || value === '') && internalValue !== 'placeholder') {
+      setInternalValue('placeholder');
+    }
+  }, [value, field.id, internalValue]);
+  
+  // Handle value change
+  const handleValueChange = (newValue: string) => {
+    setInternalValue(newValue);
+    
+    // Only pass actual values to onChange, not the placeholder
+    const finalValue = newValue === 'placeholder' ? '' : newValue;
+    
+    // Pass the value to parent component
+    onChange(finalValue);
+  };
+
+  return (
+    <div className="mb-4" key={field.id}>
+      <div className="space-y-2">
+        <Label htmlFor={field.id} className="text-sm font-medium">
+          {displayLabel}
+          {field.required && <span className="text-destructive ml-1">*</span>}
+        </Label>
+        <Select
+          value={internalValue}
+          onValueChange={handleValueChange}
+          name={field.id}
+        >
+          <SelectTrigger className={error ? "border-destructive" : ""}>
+            <SelectValue placeholder={field.placeholder || "Select an option"} />
+          </SelectTrigger>
+          <SelectContent>
+            {/* Add a placeholder option at the top */}
+            <SelectItem value="placeholder">Select an option</SelectItem>
+            
+            {options.length > 0 ? 
+              options.map((option) => {
+                // Ensure we're working with a properly normalized option
+                // This is critical for preventing [object Object] display issues
+                let normalizedOption;
+                try {
+                  // First try to normalize the option
+                  normalizedOption = normalizeOption(option);
+                  
+                  // If we still have an object without proper string values, create a readable version
+                  if (typeof normalizedOption.label === 'object') {
+                    const stringProps = Object.entries(normalizedOption.label)
+                      .filter(([_, v]) => typeof v === 'string' || typeof v === 'number')
+                      .map(([k, v]) => `${k}: ${v}`)
+                      .join(', ');
+                    
+                    normalizedOption.label = stringProps || 'Option';
+                    normalizedOption.value = String(normalizedOption.value || normalizedOption.id || Math.random());
+                  }
+                } catch (e) {
+                  // Fallback if normalization fails
+                  console.error(`Failed to normalize option for field ${field.id}:`, e);
+                  normalizedOption = {
+                    id: `option-${Math.random().toString(36).substring(2, 9)}`,
+                    value: `option-${Math.random().toString(36).substring(2, 9)}`,
+                    label: 'Option'
+                  };
+                }
+                
+                // Skip empty values
+                if (!normalizedOption.value && !normalizedOption.label) {
+                  return null;
+                }
+                
+                // Only log in development mode and only once during initial render
+                // Remove this logging to prevent console spam
+                
+                return (
+                  <SelectItem 
+                    key={normalizedOption.id || normalizedOption.value || String(Math.random())}
+                    value={normalizedOption.value}
+                  >
+                    {typeof normalizedOption.label === 'string' ? normalizedOption.label : (normalizedOption.value || "Option")}
+                  </SelectItem>
+                );
+              }) : (
+                <SelectItem value="no-options" disabled>No options available</SelectItem>
+              )
+            }
+          </SelectContent>
+        </Select>
+        {field.helpText && (
+          <p id={`${field.id}-description`} className="text-sm text-muted-foreground">
+            {field.helpText}
+          </p>
+        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
+      </div>
+    </div>
+  );
+};
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\public\fields\RadioField.tsx
+
+import React, { useEffect, useState } from 'react';
+import { FieldConfig, FieldOption } from '@/lib/forms2/core/types';
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Label } from "@/components/ui/label";
+import { parseOptions, normalizeOption } from '../helpers/optionsHelper';
+
+interface RadioFieldProps {
+  field: FieldConfig;
+  value: any;
+  error?: string;
+  onChange: (fieldId: string, value: any) => void;
+  displayLabel: string;
+}
+
+export const RadioField: React.FC<RadioFieldProps> = ({ 
+  field, 
+  value, 
+  error, 
+  onChange,
+  displayLabel
+}) => {
+  // Extract and parse options directly (similar to DropdownField)
+  console.log(`[DEBUG] Radio field data for ${field.id}:`, field);
+  
+  // Extract options based on field structure
+  let optionsToUse = (field as any).options;
+  
+  // Handle different options formats
+  if (optionsToUse) {
+    // Check for nested options.options array (common nested structure)
+    if (typeof optionsToUse === 'object' && 
+        !Array.isArray(optionsToUse) && 
+        optionsToUse !== null && 
+        (optionsToUse as any).options && 
+        Array.isArray((optionsToUse as any).options)) {
+      console.log(`[DEBUG] Using nested options.options array for ${field.id}`);
+      optionsToUse = (optionsToUse as any).options;
+    }
+  }
+  
+  // Parse the options
+  const options = parseOptions(optionsToUse, field.id, field.label);
+  console.log(`[DEBUG] Final parsed radio options for ${field.id}:`, options);
+  
+  return (
+    <div className="mb-4" key={field.id}>
+      <div className="space-y-2">
+        <Label htmlFor={field.id} className="text-sm font-medium">
+          {displayLabel}
+          {field.required && <span className="text-destructive ml-1">*</span>}
+        </Label>
+        <RadioGroup
+          value={value || ''}
+          onValueChange={(value) => onChange(field.id, value)}
+          className="flex flex-col space-y-1"
+        >
+          {options.length > 0 ? options.map((option) => {
+            // Normalize option values
+            const normalizedOption = normalizeOption(option);
+            
+            return (
+              <div 
+                key={normalizedOption.value || String(Math.random())} 
+                className="flex items-center space-x-3 space-y-0"
+              >
+                <RadioGroupItem 
+                  value={normalizedOption.value} 
+                  id={`${field.id}-${normalizedOption.value}`} 
+                />
+                <Label 
+                  htmlFor={`${field.id}-${normalizedOption.value}`} 
+                  className="text-sm font-normal"
+                >
+                  {normalizedOption.label}
+                </Label>
+              </div>
+            );
+          }) : (
+            <div className="text-sm text-muted-foreground">No options available</div>
+          )}
+        </RadioGroup>
+        {field.helpText && (
+          <p id={`${field.id}-description`} className="text-sm text-muted-foreground">
+            {field.helpText}
+          </p>
+        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
+      </div>
+    </div>
+  );
+};
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\public\fields\DropdownField.tsx
+
+import React from 'react';
+import { FieldConfig } from '@/lib/forms2/core/types';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { parseOptions, normalizeOption } from '../helpers/optionsHelper';
+
+interface DropdownFieldProps {
+  field: FieldConfig;
+  value: any;
+  error?: string;
+  onChange: (fieldId: string, value: any) => void;
+  displayLabel: string;
+}
+
+export const DropdownField: React.FC<DropdownFieldProps> = ({ 
+  field, 
+  value, 
+  error, 
+  onChange,
+  displayLabel
+}) => {
+  // Extract options based on field structure
+  let optionsToUse = (field as any).options;
+  console.log(`[DEBUG] Initial options for ${field.id}:`, optionsToUse);
+  
+  // Handle different options formats
+  if (optionsToUse) {
+    // Handle double-nested structure: { options: { options: [...] } }
+    if (typeof optionsToUse === 'object' && 
+        !Array.isArray(optionsToUse) && 
+        optionsToUse !== null && 
+        (optionsToUse as any).options) {
+      
+      // Check if options.options is an object with its own options array
+      if (typeof (optionsToUse as any).options === 'object' && 
+          !(optionsToUse as any).options.length && // Not an array
+          (optionsToUse as any).options.options && 
+          Array.isArray((optionsToUse as any).options.options)) {
+        console.log(`[DEBUG] Found double-nested options.options.options array for ${field.id}`);
+        optionsToUse = (optionsToUse as any).options.options;
+      }
+      // Check for single-nested options.options array
+      else if (Array.isArray((optionsToUse as any).options)) {
+        console.log(`[DEBUG] Found single-nested options.options array for ${field.id}`);
+        optionsToUse = (optionsToUse as any).options;
+      }
+    }
+  }
+  
+  // Parse the options
+  const parsedOptions = parseOptions(optionsToUse, field.id, field.label);
+  console.log(`[DEBUG] Parsed options for ${field.id}:`, parsedOptions);
+  
+  return (
+    <div className="mb-4" key={field.id}>
+      <div className="space-y-2">
+        <Label htmlFor={field.id} className="text-sm font-medium">
+          {displayLabel}
+          {field.required && <span className="text-destructive ml-1">*</span>}
+        </Label>
+        <div className="relative">
+          <Select
+            value={value || ''}
+            onValueChange={(value) => onChange(field.id, value)}
+          >
+            <SelectTrigger className={error ? "border-destructive" : ""}>
+              <SelectValue placeholder={field.placeholder || "Select an option"} />
+            </SelectTrigger>
+            <SelectContent>
+              {parsedOptions.length > 0 ? 
+                parsedOptions.map((option) => {
+                  // Ensure we're working with a properly normalized option
+                  // This is critical for preventing [object Object] display issues
+                  let normalizedOption;
+                  try {
+                    // First try to normalize the option
+                    normalizedOption = normalizeOption(option);
+                    
+                    // If we still have an object without proper string values, create a readable version
+                    if (typeof normalizedOption.label === 'object') {
+                      const stringProps = Object.entries(normalizedOption.label)
+                        .filter(([_, v]) => typeof v === 'string' || typeof v === 'number')
+                        .map(([k, v]) => `${k}: ${v}`)
+                        .join(', ');
+                      
+                      normalizedOption.label = stringProps || 'Option';
+                      normalizedOption.value = String(normalizedOption.value || normalizedOption.id || Math.random());
+                    }
+                  } catch (e) {
+                    // Fallback if normalization fails
+                    console.error(`Failed to normalize option for field ${field.id}:`, e);
+                    normalizedOption = {
+                      id: `option-${Math.random().toString(36).substring(2, 9)}`,
+                      value: `option-${Math.random().toString(36).substring(2, 9)}`,
+                      label: 'Option'
+                    };
+                  }
+                  
+                  return (
+                    <SelectItem 
+                      key={normalizedOption.id || normalizedOption.value || String(Math.random())}
+                      value={normalizedOption.value}
+                    >
+                      {typeof normalizedOption.label === 'string' ? normalizedOption.label : (normalizedOption.value || "Option")}
+                    </SelectItem>
+                  );
+                }) : (
+                  <SelectItem value="no-options">No options available</SelectItem>
+                )
+              }
+              {/* No "Add new option" in public form view */}
+            </SelectContent>
+          </Select>
+        </div>
+        {field.helpText && (
+          <p id={`${field.id}-description`} className="text-sm text-muted-foreground">
+            {field.helpText}
+          </p>
+        )}
+        {error && <p className="text-sm text-destructive">{error}</p>}
+      </div>
+    </div>
+  );
+};
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\conditionalLogic\ConditionalLogicContext.tsx
+
+import React, { createContext, useContext, useState, useEffect, useReducer } from 'react';
+import { conditionalLogicReducer, initialFormState } from './conditionalLogicReducer';
+import { ConditionalLogic, FieldConfig, FieldOption } from '@/lib/forms2/core/types';
+
+export interface ConditionalLogicState {
+  fieldId: string;
+  fieldLabel?: string; // Store the field label for better matching
+  operator: 'equals' | 'not_equals' | 'contains' | 'not_contains' | 'greater_than' | 'less_than' | 'is_empty' | 'is_not_empty';
+  value: string;
+  action: 'show' | 'hide';
+}
+
+export interface ConditionalLogicContextType {
+  state: ConditionalLogicState;
+  updateState: (updates: Partial<ConditionalLogicState>) => void;
+  enabled: boolean;
+  setEnabled: (enabled: boolean) => void;
+  availableFields: FieldConfig[];
+  currentFieldId: string;
+  value?: ConditionalLogic;
+  onChange: (conditionalLogic: ConditionalLogic | undefined) => void;
+  hasOptions: boolean;
+  fieldOptions: FieldOption[];
+  selectedField?: FieldConfig;
+  formState: any; // Form state managed by the conditionalLogicReducer
+  dispatch: (action: any) => void; // Dispatch function for the conditionalLogicReducer
+}
+
+// Create the context
+const ConditionalLogicContext = createContext<ConditionalLogicContextType | undefined>(undefined);
+
+// Provider props
+interface ConditionalLogicProviderProps {
+  children: React.ReactNode;
+  value?: ConditionalLogic;
+  onChange: (conditionalLogic: ConditionalLogic | undefined) => void;
+  availableFields: FieldConfig[];
+  currentFieldId: string;
+}
+
+// Provider component
+export const ConditionalLogicProvider: React.FC<ConditionalLogicProviderProps> = ({
+  children,
+  value,
+  onChange,
+  availableFields,
+  currentFieldId,
+}) => {
+  // State for enabling/disabling conditional logic
+  const [enabled, setEnabled] = useState<boolean>(!!value);
+  
+  // Initialize form state with the conditional logic reducer
+  // This ensures values are always preserved in the form builder
+  const [formState, dispatch] = useReducer(conditionalLogicReducer, initialFormState);
+  
+  // Store field selection and values in local state to ensure persistence
+  const [state, setState] = useState<ConditionalLogicState>({
+    fieldId: value?.when?.field || '',
+    fieldLabel: value?.when?.fieldLabel || '', // Store the field label for better matching
+    operator: value?.when?.operator || 'equals',
+    value: value?.when?.value || '',
+    action: value?.action || 'show'
+  });
+
+  // Update state function
+  const updateState = (updates: Partial<ConditionalLogicState>) => {
+    console.log('[CONDITIONAL LOGIC] Updating state with:', updates);
+    console.log('[CONDITIONAL LOGIC] Previous state:', state);
+    
+    setState(prev => {
+      const newState = { ...prev, ...updates };
+      
+      // If we're updating the field, reset the value
+      if (updates.fieldId && updates.fieldId !== prev.fieldId) {
+        newState.value = '';
+        console.log('[CONDITIONAL LOGIC] Field ID changed, resetting value');
+        
+        // Also update the field label when the field ID changes
+        if (updates.fieldId) {
+          const selectedField = availableFields.find(field => field.id === updates.fieldId);
+          if (selectedField) {
+            newState.fieldLabel = selectedField.label || '';
+            console.log(`[CONDITIONAL LOGIC] Updated field label to: ${newState.fieldLabel} for field ID: ${updates.fieldId}`);
+          } else {
+            console.log(`[CONDITIONAL LOGIC] WARNING: Could not find field with ID: ${updates.fieldId}`);
+          }
+        }
+      }
+      
+      console.log('[CONDITIONAL LOGIC] New state will be:', newState);
+      return newState;
+    });
+    
+    // Update the form state directly to ensure persistence
+    if (updates.fieldId) {
+      dispatch({ 
+        type: 'SET_FIELD_VALUE', 
+        fieldId: 'when.field', 
+        value: updates.fieldId 
+      });
+      console.log('[CONDITIONAL LOGIC] Updated form state with field ID:', updates.fieldId);
+    }
+    
+    if (updates.value) {
+      dispatch({ 
+        type: 'SET_FIELD_VALUE', 
+        fieldId: `when.value.${state.fieldId}`, 
+        value: updates.value 
+      });
+      console.log('[CONDITIONAL LOGIC] Updated form state with value:', updates.value);
+    }
+    
+    // Important: We need to call onChange with the updated state to persist changes
+    // This ensures the parent component is always in sync with our internal state
+    if (enabled) {
+      // Use setTimeout to ensure this runs after the state update
+      setTimeout(() => {
+        const updatedState = { ...state, ...updates };
+        
+        // Ensure we have a field label if it's missing
+        let fieldLabel = updatedState.fieldLabel;
+        if (!fieldLabel && updatedState.fieldId) {
+          const selectedField = availableFields.find(field => field.id === updatedState.fieldId);
+          if (selectedField) {
+            fieldLabel = selectedField.label || '';
+          }
+        }
+        
+        const conditionalLogic: ConditionalLogic = {
+          action: updatedState.action,
+          when: {
+            field: updatedState.fieldId,
+            fieldLabel: fieldLabel,
+            operator: updatedState.operator,
+            value: updatedState.value
+          }
+        };
+        
+        console.log('Saving updated conditional logic:', conditionalLogic);
+        onChange(conditionalLogic);
+      }, 0);
+    }
+  };
+
+  // Effect to update the parent component when enabled state changes
+  useEffect(() => {
+    if (enabled) {
+      // Ensure we have a field label if it's missing
+      let fieldLabel = state.fieldLabel;
+      if (!fieldLabel && state.fieldId) {
+        const selectedField = availableFields.find(field => field.id === state.fieldId);
+        if (selectedField) {
+          fieldLabel = selectedField.label || '';
+          // Update our internal state with the field label
+          setState(prev => ({ ...prev, fieldLabel }));
+        }
+      }
+      
+      // Create conditional logic from current state
+      const conditionalLogic: ConditionalLogic = {
+        action: state.action,
+        when: {
+          field: state.fieldId,
+          fieldLabel: fieldLabel,
+          operator: state.operator,
+          value: state.value
+        }
+      };
+      
+      console.log('Enabling conditional logic with:', conditionalLogic);
+      onChange(conditionalLogic);
+    } else {
+      // If disabled, clear conditional logic
+      onChange(undefined);
+    }
+  }, [enabled]);
+
+  // Filter out the current field from available fields
+  const fieldsForConditions = availableFields.filter(field => field.id !== currentFieldId);
+  
+  // Find the field with the given ID
+  const findFieldById = (id: string): FieldConfig | undefined => {
+    console.log('[CONDITIONAL LOGIC] Looking for field with ID:', id);
+    console.log('[CONDITIONAL LOGIC] Available fields details:', availableFields.map(f => ({ id: f.id, label: f.label, type: f.type })));
+    
+    // Try to find exact match first
+    let field = availableFields.find(f => f.id === id);
+    
+    if (field) {
+      console.log('[CONDITIONAL LOGIC] Found exact field match:', field.label, field.id, field.type);
+      return field;
+    }
+    
+    console.log('[CONDITIONAL LOGIC] No exact field match found for ID:', id);
+    
+    // Try to find a field with a similar ID - handle both legacy and new ID formats
+    field = availableFields.find(f => {
+      // Handle various ID formats (item_123, field-123, etc.)
+      const normalizedId = id.replace(/^(field-|item_)/, '').replace(/(_field|-field)$/, '');
+      const normalizedFieldId = f.id.replace(/^(field-|item_)/, '').replace(/(_field|-field)$/, '');
+      
+      return normalizedFieldId.includes(normalizedId) || normalizedId.includes(normalizedFieldId);
+    });
+    
+    if (field) {
+      console.log('[CONDITIONAL LOGIC] Found field with similar ID:', field.id, field.label, field.type);
+      return field;
+    }
+    
+    // Try to find by label if available
+    if (state.fieldLabel) {
+      field = availableFields.find(f => 
+        f.label === state.fieldLabel || 
+        f.label?.toLowerCase() === state.fieldLabel?.toLowerCase()
+      );
+      
+      if (field) {
+        console.log('[CONDITIONAL LOGIC] Found field by matching label:', field.label, field.type);
+        return field;
+      }
+    }
+    
+    // If we still haven't found it, try to find by value patterns in the ID
+    // This helps with legacy forms where IDs might have changed format
+    if (id.includes('nationality') || id.includes('province') || id.includes('service')) {
+      field = availableFields.find(f => 
+        f.label?.toLowerCase().includes('nationality') || 
+        f.label?.toLowerCase().includes('province') || 
+        f.label?.toLowerCase().includes('service')
+      );
+      
+      if (field) {
+        console.log('[CONDITIONAL LOGIC] Found field by keyword in label:', field.label, field.type);
+        return field;
+      }
+    }
+    
+    console.log('[CONDITIONAL LOGIC] No matching field found for ID:', id);
+    return undefined;
+  };
+  
+  // Determine if the selected field has options
+  // First try to find by exact ID match
+  let selectedField = state.fieldId ? findFieldById(state.fieldId) : undefined;
+  
+  // If not found, try to find by label or similar ID
+  if (!selectedField && state.fieldId) {
+    console.log('[CONDITIONAL LOGIC] Field not found by exact ID, trying alternative methods');
+    
+    // Try to find by label
+    if (state.fieldLabel) {
+      const fieldByLabel = availableFields.find(f => 
+        f.label === state.fieldLabel || 
+        f.label?.toLowerCase() === state.fieldLabel?.toLowerCase()
+      );
+      
+      if (fieldByLabel) {
+        console.log('[CONDITIONAL LOGIC] Found field by label match:', fieldByLabel);
+        selectedField = fieldByLabel;
+      }
+    }
+    
+    // Try to find by similar ID if still not found
+    if (!selectedField) {
+      // Try to find by ID pattern
+      const fieldBySimilarId = availableFields.find(f => {
+        // Check if the IDs share a common base (ignoring prefixes/suffixes)
+        const normalizedStateId = state.fieldId.replace(/^(field-|item_)/, '').replace(/(_field|-field)$/, '');
+        const normalizedFieldId = f.id.replace(/^(field-|item_)/, '').replace(/(_field|-field)$/, '');
+        
+        return normalizedFieldId.includes(normalizedStateId) || 
+               normalizedStateId.includes(normalizedFieldId);
+      });
+      
+      if (fieldBySimilarId) {
+        console.log('[CONDITIONAL LOGIC] Found field by similar ID:', fieldBySimilarId);
+        selectedField = fieldBySimilarId;
+      }
+    }
+  }
+  
+  console.log('[CONDITIONAL LOGIC] Selected field:', selectedField);
+  
+  // Check if field is a dropdown type
+  const isDropdownType = selectedField?.type === 'select' || 
+                        selectedField?.type === 'radio' || 
+                        selectedField?.type === 'checkbox';
+  
+  // Determine if the field has options
+  const hasOptions = (!!selectedField && 
+                     (selectedField as any).options && 
+                     (selectedField as any).options.length > 0) || 
+                     isDropdownType;
+  
+  // Get options for the selected field
+  const fieldOptions = selectedField ? (() => {
+    const fieldOptionsData = (selectedField as any).options;
+    
+    // Handle different formats of options
+    let optionsArray = [];
+    
+    if (!fieldOptionsData) {
+      return [];
+    }
+    
+    if (Array.isArray(fieldOptionsData)) {
+      // If options is already an array, use it directly
+      optionsArray = fieldOptionsData;
+    } else if (typeof fieldOptionsData === 'object' && Array.isArray(fieldOptionsData.options)) {
+      // If options is an object with a nested options array
+      // This matches the JSON structure: {"name": "...", "options": [...]}
+      optionsArray = fieldOptionsData.options;
+    } else if (typeof fieldOptionsData === 'object') {
+      // If options is an object but not an array, convert to array
+      optionsArray = Object.entries(fieldOptionsData)
+        .filter(([key]) => key !== 'name' && key !== 'label' && key !== 'type')
+        .map(([key, value]) => {
+          if (typeof value === 'object' && value !== null) {
+            return { id: key, ...value };
+          } else {
+            return { id: key, label: String(value), value: key };
+          }
+        });
+    }
+    
+    // Map to the expected format for field options
+    return optionsArray.map((option: any) => ({
+      label: option.label || option.id || '',
+      value: option.value || option.id || ''
+    }));
+  })() : [];
+
+  // This function is now defined above
+
+  // Effect to update local state when value prop changes
+  useEffect(() => {
+    console.log('[CONDITIONAL LOGIC] Value prop changed:', value);
+    console.log('[CONDITIONAL LOGIC] Available fields:', availableFields.map(f => ({ id: f.id, label: f.label, type: f.type })));
+    
+    if (value) {
+      console.log('[CONDITIONAL LOGIC] Loading conditional logic details:');
+      console.log('  - Action:', value.action);
+      console.log('  - When field:', value.when?.field);
+      console.log('  - When field label:', value.when?.fieldLabel);
+      console.log('  - Operator:', value.when?.operator);
+      console.log('  - Value:', value.when?.value);
+      
+      // First try to find the field by ID
+      let selectedFieldId = value.when?.field || '';
+      let selectedFieldLabel = value.when?.fieldLabel || '';
+      
+      // If we have a field ID but no matching field, try to find a similar field
+      if (selectedFieldId && !availableFields.some(f => f.id === selectedFieldId)) {
+        console.log(`[CONDITIONAL LOGIC] Field ID ${selectedFieldId} not found directly, trying to find a match`);
+        
+        // Try to find by label first
+        if (selectedFieldLabel) {
+          const fieldByLabel = availableFields.find(f => 
+            f.label === selectedFieldLabel || 
+            f.label?.toLowerCase() === selectedFieldLabel?.toLowerCase()
+          );
+          
+          if (fieldByLabel) {
+            console.log(`[CONDITIONAL LOGIC] Found field by label: ${fieldByLabel.label} with ID: ${fieldByLabel.id}`);
+            selectedFieldId = fieldByLabel.id;
+          }
+        }
+        
+        // If still not found, try to find by similar ID
+        if (!availableFields.some(f => f.id === selectedFieldId)) {
+          const normalizedId = selectedFieldId.replace(/^(field-|item_)/, '').replace(/(_field|-field)$/, '');
+          
+          const fieldBySimilarId = availableFields.find(f => {
+            const normalizedFieldId = f.id.replace(/^(field-|item_)/, '').replace(/(_field|-field)$/, '');
+            return normalizedFieldId.includes(normalizedId) || normalizedId.includes(normalizedFieldId);
+          });
+          
+          if (fieldBySimilarId) {
+            console.log(`[CONDITIONAL LOGIC] Found field by similar ID: ${fieldBySimilarId.id}`);
+            selectedFieldId = fieldBySimilarId.id;
+            if (!selectedFieldLabel) {
+              selectedFieldLabel = fieldBySimilarId.label || '';
+            }
+          }
+        }
+      }
+      
+      // If we have a field ID but no label, try to get the label
+      if (selectedFieldId && !selectedFieldLabel) {
+        const field = availableFields.find(f => f.id === selectedFieldId);
+        if (field) {
+          selectedFieldLabel = field.label || '';
+          console.log(`[CONDITIONAL LOGIC] Found label for field: ${selectedFieldLabel}`);
+        }
+      }
+      
+      // Create the new state with all the information we have
+      const newState = {
+        fieldId: selectedFieldId,
+        fieldLabel: selectedFieldLabel,
+        operator: value.when?.operator || 'equals',
+        value: value.when?.value || '',
+        action: value.action || 'show'
+      };
+      
+      console.log('[CONDITIONAL LOGIC] Setting state to:', newState);
+      setState(newState);
+      
+      // Also update the form state to ensure persistence
+      if (selectedFieldId) {
+        dispatch({ 
+          type: 'SET_FIELD_VALUE', 
+          fieldId: 'when.field', 
+          value: selectedFieldId 
+        });
+      }
+      
+      if (value.when?.value) {
+        dispatch({ 
+          type: 'SET_FIELD_VALUE', 
+          fieldId: `when.value.${selectedFieldId}`, 
+          value: value.when.value 
+        });
+      }
+      
+      setEnabled(true);
+    } else {
+      console.log('[CONDITIONAL LOGIC] No value provided, disabling conditional logic');
+      setEnabled(false);
+    }
+  }, [value, JSON.stringify(availableFields)]);
+
+  // Context value
+  const contextValue: ConditionalLogicContextType = {
+    state,
+    updateState,
+    enabled,
+    setEnabled,
+    availableFields: fieldsForConditions,
+    currentFieldId,
+    value,
+    onChange,
+    hasOptions,
+    fieldOptions,
+    selectedField,
+    formState, // Provide the form state managed by conditionalLogicReducer
+    dispatch  // Provide the dispatch function
+  };
+
+  return (
+    <ConditionalLogicContext.Provider value={contextValue}>
+      {children}
+    </ConditionalLogicContext.Provider>
+  );
+};
+
+// Custom hook to use the context
+export const useConditionalLogic = () => {
+  const context = useContext(ConditionalLogicContext);
+  if (context === undefined) {
+    throw new Error('useConditionalLogic must be used within a ConditionalLogicProvider');
+  }
+  return context;
+};
+
+
+C:\Users\camer\.windsurf\MOC-5\moc WS 170425\src\components\forms2\conditionalLogic\helpers.ts
+
+import { ConditionalLogic } from '@/lib/forms2/core/types';
+import { ConditionalLogicState, ConditionalLogicOperator } from './types';
+
+/**
+ * Creates a conditional logic object from the state
+ */
+export const createConditionalLogic = (state: ConditionalLogicState): ConditionalLogic => {
+  console.log('[CONDITIONAL LOGIC] Creating conditional logic from state:', state);
+  
+  return {
+    action: state.action,
+    when: {
+      field: state.fieldId,
+      fieldLabel: state.fieldLabel, // Include the field label for better field matching
+      operator: state.operator,
+      value: state.value,
+    },
+  };
+};
+
+/**
+ * Checks if the operator requires a value input
+ */
+export const operatorRequiresValue = (operator: ConditionalLogicOperator): boolean => {
+  return operator !== 'is_empty' && operator !== 'is_not_empty';
+};
+
+/**
+ * Gets a unique key for a field option
+ */
+export const getOptionKey = (option: any): string => {
+  return option.id || option.value || String(Math.random());
+};

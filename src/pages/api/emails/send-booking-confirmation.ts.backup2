@@ -1,0 +1,269 @@
+/**
+ * DEPRECATED: Legacy Booking Confirmation Email API (Forms 1.0)
+ * 
+ * This file is deprecated and will be removed in a future version.
+ * Please use the Email System 2.0 API instead.
+ */
+
+import type { NextApiRequest, NextApiResponse } from 'next';
+import prisma from '@/lib/prisma';
+import { createClient } from '@/util/supabase/api';
+import { addApiLog } from '../debug/logs';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
+
+// Import the Email System 2.0 processor
+import { processEmail2 } from '@/lib/forms2/services/email-processing/emailService2';
+
+// Standard logging header for file
+const fileName = path.basename(__filename);
+const fileVersion = '1.0 (DEPRECATED)';
+console.log(`[FILE NAME] ${fileName}`);
+console.log(`[${fileVersion} FILE]`);
+console.log(`[DEPRECATED] This file is deprecated and will be removed in a future version.`);
+console.log(`[DEPRECATED] Please use the Email System 2.0 API instead.`);
+
+interface BookingWithDetails {
+  id: string;
+  date: Date;
+  time: string | null;
+  location: string | null;
+  status: string;
+  email: string;
+  phone: string | null;
+  name: string;
+  notes: string | null;
+  form?: {
+    name: string;
+    id: string;
+  };
+  invoices?: {
+    id: string;
+    status: string;
+  }[];
+  confirmationEmailSentAt: Date | null;
+  submissions?: {
+    id: string;
+    data: any;
+  }[];
+}
+
+/**
+ * DEPRECATED: API handler for sending booking confirmation emails
+ * This API is deprecated and will be removed in a future version.
+ * Please use the Email System 2.0 API instead.
+ */
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  // Log deprecation warning
+  console.log(`[DEPRECATED] Using legacy booking confirmation email API. Please migrate to Email System 2.0.`);
+  addApiLog('[DEPRECATED] Using legacy booking confirmation email API. Please migrate to Email System 2.0.', 'info', 'emails');
+  // Check authentication
+  const supabase = createClient(req, res);
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) {
+    addApiLog('Unauthorized access attempt to send-booking-confirmation', 'error', 'emails');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Only allow POST requests
+  if (req.method !== 'POST') {
+    addApiLog(`Method not allowed: ${req.method}`, 'error', 'emails');
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    const { bookingId, templateId } = req.body;
+
+    if (!bookingId) {
+      addApiLog('Missing booking ID in request body', 'error', 'emails');
+      return res.status(400).json({ error: 'Missing booking ID' });
+    }
+
+    addApiLog(`Processing booking confirmation for booking ID: ${bookingId}`, 'info', 'emails');
+
+    // Get the booking with form submissions
+    const booking = await prisma.booking.findFirst({
+      where: {
+        id: bookingId,
+      },
+      include: {
+        form: true,
+        invoices: {
+          orderBy: {
+            createdAt: 'desc'
+          },
+          where: {
+            status: { not: 'voided' }
+          },
+          take: 1
+        },
+        submissions: {
+          orderBy: {
+            createdAt: 'desc'
+          },
+          take: 1
+        }
+      },
+    }) as unknown as BookingWithDetails;
+
+    if (!booking) {
+      addApiLog(`Booking not found with ID: ${bookingId}`, 'error', 'emails');
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    addApiLog(`Found booking: ${booking.name} (${booking.email})`, 'success', 'emails');
+
+    // Get the email template
+    let template;
+    if (templateId) {
+      template = await prisma.emailTemplate.findFirst({
+        where: {
+          id: templateId,
+        },
+      });
+      addApiLog(`Using specific template ID: ${templateId}`, 'info', 'emails');
+    } else {
+      // Get the default booking confirmation template
+      template = await prisma.emailTemplate.findFirst({
+        where: {
+          type: 'BOOKING_CONFIRMATION',
+        },
+      });
+      addApiLog(`Using default BOOKING_CONFIRMATION template`, 'info', 'emails');
+    }
+
+    if (!template) {
+      addApiLog('Email template not found', 'error', 'emails');
+      return res.status(404).json({ error: 'Email template not found' });
+    }
+
+    addApiLog(`Found template: ${template.name}`, 'success', 'emails');
+
+    // Get the recipient email
+    const recipientEmail = booking.email;
+    if (!recipientEmail) {
+      addApiLog('No recipient email found for this booking', 'error', 'emails');
+      return res.status(400).json({ error: 'No recipient email found for this booking' });
+    }
+
+    // Prepare comprehensive data for template variables
+    const formSubmissionData = booking.submissions && booking.submissions.length > 0 
+      ? booking.submissions[0].data || {} 
+      : {};
+
+    const data = {
+      // Basic booking info
+      name: booking.name,
+      firstName: booking.name.split(' ')[0] || booking.name,
+      date: booking.date ? new Date(booking.date).toLocaleDateString() : '',
+      time: booking.time || '',
+      location: booking.location || '',
+      formName: booking.form?.name || '',
+      status: booking.status,
+      email: booking.email,
+      phone: booking.phone || '',
+      notes: booking.notes || '',
+      
+      // Form submission data
+      ...formSubmissionData,
+      
+      // Invoice link
+      invoiceLink: booking.invoices && booking.invoices.length > 0 
+        ? `${process.env.NEXT_PUBLIC_BASE_URL || ''}/invoices/${booking.invoices[0].id}/view` 
+        : '',
+      
+      // Add submission and booking objects for direct access
+      submission: booking.submissions && booking.submissions.length > 0 
+        ? booking.submissions[0] 
+        : null,
+      booking: booking,
+      
+      // Add timeStamp for tracking
+      timeStamp: Date.now().toString(),
+      
+      // Add correlation ID for tracking
+      correlationId: uuidv4()
+    };
+
+    addApiLog(`Prepared data for template variables with ${Object.keys(data).length} fields`, 'info', 'emails');
+    console.log(`[EMAIL SYSTEM] Using Email System 2.0 processor for booking confirmation email`);
+
+    // Use the Email System 2.0 processor
+    const submissionId = booking.submissions && booking.submissions.length > 0 
+      ? booking.submissions[0].id 
+      : undefined;
+    
+    const formId = booking.form?.id;
+    
+    if (!formId) {
+      addApiLog('No form ID found for this booking', 'error', 'emails');
+      return res.status(400).json({ error: 'No form ID found for this booking' });
+    }
+    
+    // Process the email using the Email System 2.0 processor
+    const result = await processEmail2({
+      templateId: template.id,
+      recipient: recipientEmail,
+      data,
+      submissionId: submissionId || undefined, // Make sure it's undefined if null
+      formId,
+      userId: user.id || '', // Ensure userId is never undefined
+      source: 'booking-confirmation' as any // Type cast to avoid TypeScript error
+    });
+
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to send email');
+    }
+
+    addApiLog(`Email sent successfully to ${recipientEmail}`, 'success', 'emails');
+
+    // Update the booking to mark confirmation email as sent
+    await prisma.booking.update({
+      where: { id: booking.id },
+      data: {
+        confirmationEmailSent: true,
+        confirmationEmailSentAt: new Date(),
+      },
+    });
+
+    addApiLog(`Booking updated with confirmationEmailSent=true`, 'success', 'emails');
+
+    return res.status(200).json({ 
+      success: true,
+      message: 'Booking confirmation email sent successfully',
+      emailLogId: result.emailLogId
+    });
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    addApiLog(`Error sending booking confirmation email: ${errorMessage}`, 'error', 'emails');
+    console.error('Error sending booking confirmation email:', error);
+    
+    // Log the failed email attempt
+    if (req.body.bookingId && req.body.templateId) {
+      try {
+        await prisma.emailLog.create({
+          data: {
+            templateId: req.body.templateId,
+            recipient: 'unknown',
+            subject: 'Booking Confirmation',
+            userId: user.id || '', // Ensure userId is never undefined
+            status: 'FAILED',
+            error: errorMessage,
+            bookingId: req.body.bookingId,
+          },
+        });
+      } catch (logError) {
+        console.error('Error logging email failure:', logError);
+      }
+    }
+    
+    return res.status(500).json({ 
+      error: 'Failed to send booking confirmation email',
+      details: errorMessage
+    });
+  }
+}

@@ -1,0 +1,685 @@
+import { useEffect, useState } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import { useRouter } from "next/router";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter } from "@/components/ui/dialog";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { MoreHorizontal, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { DeleteBookingDialog } from "@/components/DeleteBookingDialog";
+import { debug } from "@/util/logger";
+import DateRangeFilter from "@/components/DateRangeFilter";
+import SearchFilter from "@/components/SearchFilter";
+import { FieldValueDisplay } from "@/components/ui/field-value-display";
+import { toast } from "@/components/ui/use-toast";
+
+interface FormField {
+  id: string;
+  label: string;
+  type: string;
+  options?: string[];
+  excludeTime?: boolean;
+  required?: boolean;
+  sectionId: string;
+}
+
+interface FormSection {
+  id: string;
+  title: string;
+  description?: string;
+  order: number;
+  fields: FormField[];
+}
+
+interface Form {
+  id: string;
+  name: string;
+  formSections: FormSection[];
+}
+
+interface Booking {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  form: Form;
+  createdAt: string;
+  date: string;
+  status: string;
+  mappedData: Record<string, any>;
+  submissions: {
+    id: string;
+    data: Record<string, any>;
+  }[];
+  isFormSystem2?: boolean; // Flag to identify Form System 2.0 bookings
+}
+
+export default function BookingsPage() {
+  const router = useRouter();
+  const [bookings, setBookings] = useState<Booking[]>([]);
+  const [selectedBooking, setSelectedBooking] = useState<Booking | null>(null);
+  const [bookingToDelete, setBookingToDelete] = useState<Booking | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const { user } = useAuth();
+
+  // Define fetchBookings outside useEffect so it can be called from other places
+  const fetchBookings = async () => {
+    setLoading(true);
+    try {
+      // Add cache-busting query parameter to ensure we get fresh data
+      const timestamp = new Date().getTime();
+      const response = await fetch(`/api/bookings?_=${timestamp}`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          // Add cache control headers to prevent caching
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "Pragma": "no-cache",
+          "Expires": "0"
+        },
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      debug('Frontend: Received bookings data:', data, 'bookings');
+      console.log('Fetched bookings:', data.length, 'records');
+      
+      // Debug Form System 2.0 bookings
+      const forms2Bookings = data.filter((booking: any) => booking.isFormSystem2);
+      console.log('Form System 2.0 bookings:', forms2Bookings.length, 'records');
+      if (forms2Bookings.length > 0) {
+        console.log('Sample Form System 2.0 booking:', {
+          id: forms2Bookings[0].id,
+          name: forms2Bookings[0].name,
+          formId: forms2Bookings[0].form?.id,
+          hasSubmissions: forms2Bookings[0].submissions?.length > 0,
+          isFormSystem2: forms2Bookings[0].isFormSystem2
+        });
+      }
+      
+      setBookings(data);
+    } catch (error) {
+      console.error("Error fetching bookings:", error);
+      setError("Failed to load bookings. Please try again.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (user) {
+      fetchBookings();
+    } else {
+      setLoading(false);
+    }
+  }, [user]);
+
+  // Add debug logging for Form System 2.0 bookings
+  useEffect(() => {
+    if (bookings.length > 0) {
+      // Use type assertion to avoid TypeScript errors
+      const forms2Bookings = bookings.filter(booking => (booking as any).isFormSystem2);
+      console.log(`Found ${forms2Bookings.length} Form System 2.0 bookings out of ${bookings.length} total bookings`);
+      
+      if (forms2Bookings.length > 0) {
+        console.log('Sample Form System 2.0 booking:', {
+          id: forms2Bookings[0].id,
+          name: forms2Bookings[0].name,
+          formId: forms2Bookings[0].form?.id,
+          hasSubmissions: forms2Bookings[0].submissions?.length > 0,
+          isFormSystem2: (forms2Bookings[0] as any).isFormSystem2
+        });
+      }
+    }
+  }, [bookings]);
+
+  const formatDate = (dateString: string) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+  };
+
+  // Filter state
+  const [searchTerm, setSearchTerm] = useState<string>('');
+  const [dateRange, setDateRange] = useState<{
+    from: Date | undefined;
+    to: Date | undefined;
+  }>({
+    from: undefined,
+    to: undefined
+  });
+  const [activeTab, setActiveTab] = useState<string>("upcoming");
+  const [filteredBookings, setFilteredBookings] = useState<Booking[]>([]);
+  
+  // Sorting state
+  const [sortField, setSortField] = useState<string>("createdAt");
+  const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc"); // Default to newest first
+  const [useAllTimeFilter, setUseAllTimeFilter] = useState<boolean>(false);
+  
+  // Pagination state
+  const [pageSize, setPageSize] = useState<number>(10); // Default to 10 items per page
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [paginatedBookings, setPaginatedBookings] = useState<Booking[]>([]);
+
+  // Apply filters whenever bookings, search term, date range, or active tab changes
+  useEffect(() => {
+    if (bookings.length === 0) {
+      setFilteredBookings([]);
+      setPaginatedBookings([]);
+      return;
+    }
+
+    let filtered = [...bookings];
+
+    // Apply search filter
+    if (searchTerm.trim() !== '') {
+      const search = searchTerm.toLowerCase().trim();
+      filtered = filtered.filter(booking => {
+        const name = (booking.name || booking.mappedData?.name || booking.mappedData?.['Full Name'] || '').toLowerCase();
+        const email = (booking.email || booking.mappedData?.email || booking.mappedData?.['Email Address'] || '').toLowerCase();
+        const phone = (booking.phone || booking.mappedData?.phone || booking.mappedData?.['Phone Number'] || booking.mappedData?.mobile || '').toLowerCase();
+        
+        return name.includes(search) || email.includes(search) || phone.includes(search);
+      });
+    }
+
+    // Apply date range filter - skip if "All time" is selected
+    if (dateRange.from && dateRange.to && !useAllTimeFilter) {
+      filtered = filtered.filter(booking => {
+        const bookingDate = new Date(booking.date);
+        return bookingDate >= dateRange.from! && bookingDate <= dateRange.to!;
+      });
+    }
+
+    // Apply tab filter
+    const now = new Date();
+    if (activeTab === "upcoming") {
+      filtered = filtered.filter(booking => new Date(booking.date) >= now);
+    } else if (activeTab === "past") {
+      filtered = filtered.filter(booking => new Date(booking.date) < now);
+    }
+    // "all" tab doesn't need additional filtering
+
+    // Apply sorting
+    filtered.sort((a, b) => {
+      let valueA, valueB;
+      
+      // Determine which field to sort by
+      if (sortField === "createdAt") {
+        valueA = new Date(a.createdAt).getTime();
+        valueB = new Date(b.createdAt).getTime();
+      } else if (sortField === "date") {
+        valueA = new Date(a.date).getTime();
+        valueB = new Date(b.date).getTime();
+      } else {
+        // Default to createdAt if sortField is not recognized
+        valueA = new Date(a.createdAt).getTime();
+        valueB = new Date(b.createdAt).getTime();
+      }
+      
+      // Apply sort direction
+      return sortDirection === "asc" ? valueA - valueB : valueB - valueA;
+    });
+
+    setFilteredBookings(filtered);
+    // Reset to first page when filters change
+    setCurrentPage(1);
+  }, [bookings, searchTerm, dateRange, activeTab, sortField, sortDirection, useAllTimeFilter]);
+  
+  // Apply pagination to filtered bookings
+  useEffect(() => {
+    if (filteredBookings.length === 0) {
+      setPaginatedBookings([]);
+      return;
+    }
+    
+    const startIndex = (currentPage - 1) * pageSize;
+    const endIndex = Math.min(startIndex + pageSize, filteredBookings.length);
+    setPaginatedBookings(filteredBookings.slice(startIndex, endIndex));
+  }, [filteredBookings, currentPage, pageSize]);
+
+  return (
+    <>
+      <main className="container mx-auto p-8">
+        <div className="rounded-lg border bg-card text-card-foreground shadow">
+          <div className="flex justify-between items-center p-6">
+            <h3 className="text-2xl font-semibold leading-none tracking-tight">Bookings Management</h3>
+            <Button 
+              onClick={fetchBookings} 
+              variant="outline" 
+              size="sm"
+              disabled={loading}
+              className="flex items-center gap-1"
+            >
+              {loading ? (
+                <>
+                  <div className="animate-spin h-4 w-4 border-2 border-current border-t-transparent rounded-full mr-1"></div>
+                  Refreshing...
+                </>
+              ) : (
+                <>
+                  <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="mr-1">
+                    <path d="M21 2v6h-6"></path>
+                    <path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path>
+                    <path d="M3 22v-6h6"></path>
+                    <path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path>
+                  </svg>
+                  Refresh
+                </>
+              )}
+            </Button>
+          </div>
+          
+          <div className="px-6 mb-4">
+            <div className="flex items-center justify-between mb-6 bg-muted/40 p-4 rounded-lg">
+              <div className="flex items-center gap-4">
+                <SearchFilter 
+                  onSearchChange={setSearchTerm} 
+                  placeholder="Search by name, email, or phone..."
+                  label="Search Bookings"
+                />
+                
+                <div>
+                  <Label className="text-sm font-medium mb-1 block">Filter by Date</Label>
+                  <DateRangeFilter onDateRangeChange={(range) => {
+                    setDateRange(range);
+                    // If both dates are undefined, it means "All time" was selected
+                    setUseAllTimeFilter(!range.from && !range.to);
+                  }} />
+                </div>
+              </div>
+            </div>
+          </div>
+          
+          <div className="px-6 mb-4">
+            <Tabs defaultValue="upcoming" value={activeTab} onValueChange={setActiveTab} className="w-full">
+              <TabsList className="mb-4">
+                <TabsTrigger value="upcoming">Upcoming Bookings</TabsTrigger>
+                <TabsTrigger value="past">Past Bookings</TabsTrigger>
+                <TabsTrigger value="all">All Bookings</TabsTrigger>
+              </TabsList>
+            </Tabs>
+          </div>
+          
+          <div className="p-6 pt-0">
+            {loading ? (
+              <div className="flex justify-center items-center py-8">
+                <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-primary"></div>
+              </div>
+            ) : error ? (
+              <div className="flex justify-center items-center py-8 text-red-500">
+                {error}
+              </div>
+            ) : bookings.length === 0 ? (
+              <div className="flex flex-col justify-center items-center py-8 text-muted-foreground">
+                <p>No bookings found</p>
+                <div className="mt-4 text-xs text-muted-foreground">
+                  <pre className="bg-muted p-2 rounded">
+                    {JSON.stringify({ totalBookings: bookings.length, forms2Bookings: bookings.filter(b => (b as any).isFormSystem2).length }, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            ) : filteredBookings.length === 0 ? (
+              <div className="flex flex-col justify-center items-center py-8 text-muted-foreground">
+                <p>No bookings match your search criteria</p>
+                <div className="mt-4 text-xs text-muted-foreground">
+                  <pre className="bg-muted p-2 rounded">
+                    {JSON.stringify({
+                      totalBookings: bookings.length,
+                      filteredBookings: filteredBookings.length,
+                      forms2Bookings: bookings.filter(b => (b as any).isFormSystem2).length,
+                      filteredForms2Bookings: filteredBookings.filter(b => (b as any).isFormSystem2).length
+                    }, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            ) : (
+              <div className="relative w-full overflow-auto">
+                <table className="w-full caption-bottom text-sm">
+                  <thead className="[&_tr]:border-b">
+                    <tr className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
+                      <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Name</th>
+                      <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Email</th>
+                      <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Phone</th>
+                      <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Form</th>
+                      <th 
+                        className={`h-12 px-4 text-left align-middle font-medium cursor-pointer ${sortField === 'createdAt' ? 'text-primary' : 'text-muted-foreground'}`}
+                        onClick={() => {
+                          if (sortField === 'createdAt') {
+                            // Toggle direction if already sorting by this field
+                            setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                          } else {
+                            // Set new sort field and default to descending (newest first)
+                            setSortField('createdAt');
+                            setSortDirection('desc');
+                          }
+                        }}
+                      >
+                        Submission Date
+                        {sortField === 'createdAt' && (
+                          <span className="ml-1">{sortDirection === 'asc' ? '↑' : '↓'}</span>
+                        )}
+                      </th>
+                      <th 
+                        className={`h-12 px-4 text-left align-middle font-medium cursor-pointer ${sortField === 'date' ? 'text-primary' : 'text-muted-foreground'}`}
+                        onClick={() => {
+                          if (sortField === 'date') {
+                            // Toggle direction if already sorting by this field
+                            setSortDirection(sortDirection === 'asc' ? 'desc' : 'asc');
+                          } else {
+                            // Set new sort field and default to ascending (closest date first)
+                            setSortField('date');
+                            setSortDirection('asc');
+                          }
+                        }}
+                      >
+                        Wedding Date
+                        {sortField === 'date' && (
+                          <span className="ml-1">{sortDirection === 'asc' ? '↑' : '↓'}</span>
+                        )}
+                      </th>
+                      <th className="h-12 px-4 text-left align-middle font-medium text-muted-foreground">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="[&_tr:last-child]:border-0">
+                    {paginatedBookings.map((booking) => (
+                      <tr key={booking.id} className="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
+                        <td className="p-4 align-middle">{booking.name || booking.mappedData?.name || booking.mappedData?.['Full Name'] || 'N/A'}</td>
+                        <td className="p-4 align-middle">{booking.email || booking.mappedData?.email || booking.mappedData?.['Email Address'] || 'N/A'}</td>
+                        <td className="p-4 align-middle">{booking.phone || booking.mappedData?.phone || booking.mappedData?.['Phone Number'] || booking.mappedData?.mobile || 'N/A'}</td>
+                        <td className="p-4 align-middle">{booking.form.name}</td>
+                        <td className="p-4 align-middle">{formatDate(booking.createdAt)}</td>
+                        <td className="p-4 align-middle">{formatDate(booking.date)}</td>
+                        <td className="p-4 align-middle">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button variant="ghost" className="h-8 w-8 p-0">
+                                <span className="sr-only">Open menu</span>
+                                <MoreHorizontal className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              <DropdownMenuItem onClick={async () => {
+                                try {
+                                  const response = await fetch(`/api/bookings/${booking.id}`);
+                                  if (!response.ok) {
+                                    throw new Error('Failed to fetch booking details');
+                                  }
+                                  const detailedBooking = await response.json();
+                                  setSelectedBooking(detailedBooking);
+                                } catch (error) {
+                                  console.error('Error fetching booking details:', error);
+                                  // Fallback to using the booking from the list
+                                  setSelectedBooking(booking);
+                                }
+                              }}>
+                                View Details
+                              </DropdownMenuItem>
+                              <DropdownMenuItem onClick={async () => {
+                                try {
+                                  const response = await fetch(`/api/bookings/${booking.id}/document`);
+                                  if (!response.ok) throw new Error('Failed to download document');
+                                  
+                                  const blob = await response.blob();
+                                  const url = window.URL.createObjectURL(blob);
+                                  const a = document.createElement('a');
+                                  a.href = url;
+                                  a.download = `booking-${booking.id}.docx`;
+                                  document.body.appendChild(a);
+                                  a.click();
+                                  window.URL.revokeObjectURL(url);
+                                  document.body.removeChild(a);
+                                } catch (error) {
+                                  console.error('Error downloading document:', error);
+                                  // TODO: Add proper error notification
+                                }
+                              }}>
+                                Download Document
+                              </DropdownMenuItem>
+                              <DropdownMenuItem 
+                                onClick={async () => {
+                                  try {
+                                    // Check if booking already has an active invoice
+                                    const response = await fetch(`/api/bookings/${booking.id}/invoices`);
+                                    if (!response.ok) {
+                                      throw new Error(`Failed to check for existing invoices: ${response.status}`);
+                                    }
+                                    
+                                    const data = await response.json();
+                                    console.log('Invoices for booking:', data);
+                                    const activeInvoices = data.filter((invoice: any) => invoice.status !== 'voided');
+                                    
+                                    if (activeInvoices.length > 0) {
+                                      // If there's an active invoice, show a warning
+                                      toast({
+                                        title: "Invoice Already Exists",
+                                        description: "This booking already has an active invoice. You cannot create another invoice until the existing one is voided.",
+                                        variant: "destructive",
+                                      });
+                                      return;
+                                    }
+                                    
+                                    // If no active invoice exists, redirect to invoice creation page
+                                    router.push(`/dashboard/invoices/create?bookingId=${booking.id}`);
+                                  } catch (error) {
+                                    console.error('Error checking for existing invoices:', error);
+                                    toast({
+                                      title: "Error",
+                                      description: "Failed to check for existing invoices. Please try again.",
+                                      variant: "destructive",
+                                    });
+                                  }
+                                }}
+                              >
+                                Create Invoice
+                              </DropdownMenuItem>
+                              <DropdownMenuItem 
+                                className="text-destructive"
+                                onClick={() => setBookingToDelete(booking)}
+                              >
+                                <Trash2 className="mr-2 h-4 w-4" />
+                                Delete Booking
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                
+                {/* Pagination Controls */}
+                <div className="mt-4 flex items-center justify-between px-2">
+                  <div className="flex items-center space-x-2">
+                    <span className="text-sm text-muted-foreground">
+                      Showing {paginatedBookings.length} of {filteredBookings.length} bookings
+                    </span>
+                    <select
+                      className="h-8 rounded-md border border-input bg-background px-2 py-1 text-sm ring-offset-background focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                      value={pageSize}
+                      onChange={(e) => {
+                        setPageSize(Number(e.target.value));
+                        setCurrentPage(1); // Reset to first page when changing page size
+                      }}
+                    >
+                      <option value={10}>10 per page</option>
+                      <option value={25}>25 per page</option>
+                      <option value={50}>50 per page</option>
+                    </select>
+                  </div>
+                  
+                  <div className="flex items-center space-x-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                      disabled={currentPage === 1}
+                    >
+                      Previous
+                    </Button>
+                    <span className="text-sm">
+                      Page {currentPage} of {Math.max(1, Math.ceil(filteredBookings.length / pageSize))}
+                    </span>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => 
+                        setCurrentPage(Math.min(Math.ceil(filteredBookings.length / pageSize), currentPage + 1))
+                      }
+                      disabled={currentPage >= Math.ceil(filteredBookings.length / pageSize)}
+                    >
+                      Next
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </main>
+
+      {/* Delete Confirmation Dialog */}
+      <DeleteBookingDialog
+        booking={bookingToDelete}
+        onClose={() => setBookingToDelete(null)}
+        onDelete={() => {
+          setBookings(bookings.filter(b => b.id !== bookingToDelete?.id));
+          setBookingToDelete(null);
+        }}
+      />
+
+      {/* Booking Details Dialog */}
+      <Dialog open={!!selectedBooking} onOpenChange={(open) => !open && setSelectedBooking(null)}>
+        <DialogContent className="max-w-4xl max-h-[90vh]">
+          <DialogHeader>
+            <DialogTitle className="text-2xl">Booking Details</DialogTitle>
+          </DialogHeader>
+          <ScrollArea className="h-[calc(90vh-8rem)] pr-4">
+            {selectedBooking && (
+              <div className="space-y-8">
+                {/* Basic Info Section */}
+                <div className="rounded-lg border bg-card shadow-sm">
+                  <div className="border-b bg-muted/50 p-4">
+                    <h3 className="text-lg font-semibold">Basic Information</h3>
+                  </div>
+                  <div className="p-4 space-y-4">
+                    {[
+                      { label: 'Form', value: selectedBooking.form.name },
+                      { label: 'Date', value: formatDate(selectedBooking.createdAt) },
+                      { label: 'Name', value: selectedBooking.name || selectedBooking.mappedData?.name || selectedBooking.mappedData?.['Full Name'] || 'N/A' },
+                      { label: 'Email', value: selectedBooking.email || selectedBooking.mappedData?.email || selectedBooking.mappedData?.['Email Address'] || 'N/A' },
+                      { label: 'Phone', value: selectedBooking.phone || selectedBooking.mappedData?.phone || selectedBooking.mappedData?.['Phone Number'] || selectedBooking.mappedData?.mobile || 'N/A' }
+                    ].map((field, index) => (
+                      <div key={index} className="grid grid-cols-3 items-center gap-4">
+                        <label className="text-sm font-medium text-muted-foreground">
+                          {field.label}
+                        </label>
+                        <div className="col-span-2 text-sm">
+                          <FieldValueDisplay value={field.value} />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Form Sections */}
+                {selectedBooking.form.formSections?.map((section, sectionIndex) => {
+                  // Get the latest submission data
+                  const submissionData = selectedBooking.submissions?.[0]?.data || {};
+
+                  // Only render sections that have fields
+                  if (!section.fields || section.fields.length === 0) return null;
+
+                  return (
+                    <div key={section.id} className="rounded-lg border bg-card shadow-sm">
+                      <div className="border-b bg-muted/50 p-4">
+                        <h3 className="text-lg font-semibold">{section.title || `Section ${sectionIndex + 1}`}</h3>
+                        {section.description && (
+                          <p className="mt-1 text-sm text-muted-foreground">{section.description}</p>
+                        )}
+                      </div>
+                      <div className="p-4 space-y-4">
+                        {section.fields.map(field => {
+                          const key = field.id;
+                          // Try to get value from submissions first, then fallback to mappedData
+                          const value = submissionData[key] ?? selectedBooking.mappedData?.[key];
+                          const fieldLabel = field.label;
+
+                          // Format the value based on its type and the field type
+                          let formattedValue = value;
+                          let valueDisplay = "—"; // Default display for empty values
+
+                          if (value !== undefined && value !== null && value !== "") {
+                            // Handle date values
+                            if (typeof value === 'string' && value.match(/^\d{4}-\d{2}-\d{2}/)) {
+                              try {
+                                // Check if the field type is date but excludes time
+                                if (field.type === 'date' && field.excludeTime) {
+                                  formattedValue = new Date(value).toLocaleDateString('en-US', {
+                                    year: 'numeric',
+                                    month: 'long',
+                                    day: 'numeric'
+                                  });
+                                } else {
+                                  formattedValue = new Date(value).toLocaleDateString('en-US', {
+                                    year: 'numeric',
+                                    month: 'long',
+                                    day: 'numeric',
+                                    hour: '2-digit',
+                                    minute: '2-digit'
+                                  });
+                                }
+                              } catch (e) {
+                                formattedValue = value;
+                              }
+                            }
+                            
+                            // Handle boolean values
+                            if (typeof value === 'boolean') {
+                              formattedValue = value ? 'Yes' : 'No';
+                            }
+                            
+                            // Handle array values
+                            if (Array.isArray(value)) {
+                              formattedValue = value.join(', ');
+                            }
+                            
+                            // Handle object values
+                            if (typeof value === 'object' && value !== null) {
+                              formattedValue = JSON.stringify(value, null, 2);
+                            }
+
+                            valueDisplay = String(formattedValue);
+                          }
+
+                          return (
+                            <div key={key} className="grid grid-cols-3 items-start gap-4">
+                              <label className="text-sm font-medium text-muted-foreground pt-1">
+                                {fieldLabel}
+                              </label>
+                              <div className="col-span-2 text-sm break-words whitespace-pre-wrap">
+                                <FieldValueDisplay value={value} />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </ScrollArea>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}

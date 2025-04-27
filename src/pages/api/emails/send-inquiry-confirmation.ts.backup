@@ -1,0 +1,284 @@
+/**
+ * DEPRECATED: Legacy Inquiry Confirmation Email API (Forms 1.0)
+ * 
+ * This file is deprecated and will be removed in a future version.
+ * Please use the Email System 2.0 API instead.
+ */
+
+import type { NextApiRequest, NextApiResponse } from 'next';
+import prisma from '@/lib/prisma';
+import { createClient } from '@/util/supabase/api';
+import path from 'path';
+import { v4 as uuidv4 } from 'uuid';
+
+// Import the Email System 2.0 processor
+import { processEmail2 } from '@/lib/forms2/services/email-processing/emailService2';
+import { addApiLog } from '../debug/logs';
+
+// Standard logging header for file
+const fileName = path.basename(__filename);
+const fileVersion = '1.0 (DEPRECATED)';
+console.log(`[FILE NAME] ${fileName}`);
+console.log(`[${fileVersion} FILE]`);
+console.log(`[DEPRECATED] This file is deprecated and will be removed in a future version.`);
+console.log(`[DEPRECATED] Please use the Email System 2.0 API instead.`);
+
+/**
+ * DEPRECATED: API handler for sending inquiry confirmation emails
+ * This API is deprecated and will be removed in a future version.
+ * Please use the Email System 2.0 API instead.
+ */
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse
+) {
+  // Log deprecation warning
+  console.log(`[DEPRECATED] Using legacy inquiry confirmation email API. Please migrate to Email System 2.0.`);
+  addApiLog('[DEPRECATED] Using legacy inquiry confirmation email API. Please migrate to Email System 2.0.', 'info', 'emails');
+  // Check authentication
+  const supabase = createClient(req, res);
+  const { data: { user } } = await supabase.auth.getUser();
+
+  if (!user) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  // Only allow POST requests
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+
+  try {
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[DEBUG] Starting inquiry confirmation email process');
+    }
+    const { leadId, templateId } = req.body;
+
+    console.log('[DEBUG] Request data:', {
+      leadId,
+      templateId,
+      headers: {
+        auth: !!req.headers.authorization,
+        cookie: !!req.headers.cookie
+      }
+    });
+
+    if (!leadId) {
+      console.error('[DEBUG] Missing lead ID');
+      return res.status(400).json({ error: 'Missing lead ID' });
+    }
+
+    // Get the lead
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[DEBUG] Fetching lead:', leadId);
+    }
+    const lead = await prisma.lead.findFirst({
+      where: {
+        id: leadId,
+      },
+      include: {
+        form: true,
+        submissions: {
+          orderBy: {
+            createdAt: 'desc'
+          },
+          take: 1
+        }
+      },
+    });
+
+    if (!lead) {
+      console.error('[DEBUG] Lead not found:', leadId);
+      return res.status(404).json({ error: 'Lead not found' });
+    }
+
+    console.log('[DEBUG] Found lead:', {
+      id: lead.id,
+      name: lead.name,
+      email: lead.email,
+      formId: lead.formId
+    });
+
+    // Get the email template
+    let template;
+    if (templateId) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[DEBUG] Fetching specific template:', templateId);
+      }
+      template = await prisma.emailTemplate.findFirst({
+        where: {
+          id: templateId,
+          userId: user.id
+        },
+      });
+    } else {
+      // Get the inquiry template for the user
+      if (process.env.NODE_ENV !== 'production') {
+        console.log('[DEBUG] Fetching user inquiry template');
+      }
+      template = await prisma.emailTemplate.findFirst({
+        where: {
+          type: 'INQUIRY',
+          userId: user.id
+        },
+      });
+      
+      // If no template exists, try to create default templates
+      if (!template) {
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[DEBUG] No inquiry template found, attempting to create defaults');
+        }
+        try {
+          // Import the ensure function dynamically to avoid circular dependencies
+          const ensureDefaultsResponse = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL}/api/emails/templates/ensure-defaults`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': req.headers.authorization || '',
+              'Cookie': req.headers.cookie || ''
+            }
+          });
+          
+          if (ensureDefaultsResponse.ok) {
+            if (process.env.NODE_ENV !== 'production') {
+              console.log('[DEBUG] Default templates created successfully');
+            }
+            // Try to get the template again
+            template = await prisma.emailTemplate.findFirst({
+              where: {
+                type: 'INQUIRY',
+                userId: user.id
+              },
+            });
+          } else {
+            console.error('[DEBUG] Failed to create default templates');
+          }
+        } catch (templateError) {
+          console.error('[DEBUG] Error creating default templates:', templateError);
+        }
+      }
+    }
+
+    if (!template) {
+      console.error('[DEBUG] Email template not found');
+      return res.status(404).json({ error: 'Email template not found' });
+    }
+
+    console.log('[DEBUG] Found template:', {
+      id: template.id,
+      type: template.type,
+      subject: template.subject
+    });
+
+    // Get the recipient email
+    const recipientEmail = lead.email;
+    if (!recipientEmail) {
+      console.error('[DEBUG] No recipient email found for lead:', leadId);
+      return res.status(400).json({ error: 'No recipient email found for this lead' });
+    }
+
+    // Get the latest submission data
+    const submissionData = lead.submissions[0]?.data || {};
+
+    // Prepare data for template variables
+    const data = {
+      name: lead.name || '',
+      email: lead.email || '',
+      phone: lead.phone || '',
+      formName: lead.form?.name || '',
+      submissionData: Object.entries(submissionData)
+        .map(([key, value]) => `${key}: ${value}`)
+        .join('\n'),
+      status: lead.status,
+      createdAt: lead.createdAt.toLocaleDateString(),
+      // Add all submission data as a flattened object
+      ...(typeof submissionData === 'object' ? submissionData : {}),
+      // Add lead object for direct access
+      lead: lead,
+      // Add submission object for direct access
+      submission: lead.submissions[0] || null,
+      // Add timeStamp for tracking
+      timeStamp: Date.now().toString(),
+      // Add correlation ID for tracking
+      correlationId: uuidv4()
+    };
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[DEBUG] Template data:', data);
+    }
+
+    console.log('[DEBUG] Prepared data for template variables with', Object.keys(data).length, 'fields');
+    console.log('[EMAIL SYSTEM] Using Email System 2.0 processor for inquiry confirmation email');
+    
+    // Get the submission ID if available
+    const submissionId = lead.submissions[0]?.id;
+    
+    // Get the form ID
+    const formId = lead.formId;
+    
+    if (!formId) {
+      console.error('[DEBUG] No form ID found for this lead');
+      return res.status(400).json({ error: 'No form ID found for this lead' });
+    }
+    
+    // Process the email using the Email System 2.0 processor
+    const result = await processEmail2({
+      templateId: template.id,
+      recipient: recipientEmail,
+      data,
+      submissionId,
+      formId,
+      userId: user.id || '',
+      // Additional metadata in the correlationId field
+      correlationId: `inquiry-confirmation-${uuidv4()}`
+    });
+
+    if (!result.success) {
+      throw new Error(result.error || 'Failed to send email');
+    }
+
+    console.log('[DEBUG] Email sent successfully to', recipientEmail);
+
+    // Update the lead status to indicate email was sent
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[DEBUG] Updating lead status');
+    }
+    await prisma.lead.update({
+      where: { id: lead.id },
+      data: {
+        status: 'EMAIL_SENT',
+      },
+    });
+
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[DEBUG] Email process completed successfully');
+    }
+    return res.status(200).json({ 
+      success: true,
+      message: 'Inquiry confirmation email sent successfully',
+      emailLogId: result.emailLogId 
+    });
+  } catch (error) {
+    console.error('Error sending inquiry confirmation email:', error);
+    
+    // Log the failed email attempt
+    if (req.body.leadId && req.body.templateId) {
+      try {
+        await prisma.emailLog.create({
+          data: {
+            templateId: req.body.templateId,
+            recipient: 'unknown',
+            subject: 'Inquiry Confirmation',
+            userId: user.id || '',
+            status: 'FAILED',
+            error: error instanceof Error ? error.message : 'Unknown error',
+          },
+        });
+      } catch (logError) {
+        console.error('Error logging email failure:', logError);
+      }
+    }
+    
+    return res.status(500).json({ error: 'Failed to send inquiry confirmation email' });
+  }
+}
